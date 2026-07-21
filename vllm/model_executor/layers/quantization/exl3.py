@@ -3,14 +3,17 @@
 
 """EXL3 (ExLlamaV3 trellis) quantization support.
 
-This is deliberately the correctness backend.  Every logical checkpoint
-matrix is dispatched independently through ``exllamav3_ext.exl3_gemm``.  In
-particular, vLLM's packed QKV and gate/up modules are *not* treated as one EXL3
-matrix: each source matrix owns its own Hadamard vectors and codebook marker.
+Rank-sliced routed-expert checkpoints use Sparkinfer's planned full-rotation
+Trellis MoE API for the decode window and the ExLlamaV3 extension for larger
+prefill batches. Generic dense and non-rank-sliced MoE checkpoints use the
+bit-faithful ``exllamav3_ext.exl3_gemm`` parity path. Every logical checkpoint
+matrix is dispatched independently: vLLM's packed QKV and gate/up modules are
+not treated as one EXL3 matrix because each source matrix owns its Hadamard
+vectors and codebook marker.
 
-The extension is imported lazily on the first CUDA execution.  Importing this
-module, parsing checkpoint metadata, or compiling it with ``py_compile`` does
-not load the extension or initialize CUDA.
+Both dependencies are imported lazily. Importing this module, parsing
+checkpoint metadata, or compiling it with ``py_compile`` does not load either
+one or initialize CUDA.
 """
 
 from __future__ import annotations
@@ -21,6 +24,7 @@ import os
 import sys
 from typing import TYPE_CHECKING, Any
 
+import regex as re
 import torch
 from transformers import PretrainedConfig
 
@@ -54,6 +58,7 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
         SharedExperts,
     )
+    from vllm.model_executor.layers.quantization import QuantizationMethods
     from vllm.model_executor.models.utils import WeightsMapper
 
 logger = init_logger(__name__)
@@ -62,6 +67,13 @@ _MCG_SENTINEL = 0xCBAC1FED
 _MUL1_SENTINEL = 0x83DCD12D
 _HADAMARD_BLOCK = 128
 _EXL3_EXT: Any | None = None
+_SPARKINFER_TRELLIS_API: Any | None = None
+_RANK_SLICED_RUNTIMES: dict[tuple[Any, ...], dict[str, Any]] = {}
+_RANK_SLICED_FORMAT = "exl3-trellis"
+_RANK_SLICED_WEIGHT_RE = re.compile(
+    r"^(?P<prefix>.+)\.rank(?P<rank>\d+)\."
+    r"(?P<field>trellis|suh|svh|mcg|mul1)$"
+)
 
 ShardId = str | int | tuple[int, ...] | None
 
@@ -100,6 +112,30 @@ def _load_exl3_ext() -> Any:
         )
     _EXL3_EXT = ext
     return ext
+
+
+def _load_sparkinfer_trellis() -> Any:
+    """Resolve the public planned Trellis MoE API lazily."""
+
+    global _SPARKINFER_TRELLIS_API
+    if _SPARKINFER_TRELLIS_API is not None:
+        return _SPARKINFER_TRELLIS_API
+    try:
+        from sparkinfer.moe import trellis_moe
+    except Exception as exc:
+        raise RuntimeError(
+            "Rank-sliced EXL3 requires sparkinfer.moe.trellis_moe. Install "
+            "a Sparkinfer build containing the planned full-rotation API."
+        ) from exc
+    _SPARKINFER_TRELLIS_API = trellis_moe
+    return trellis_moe
+
+
+def _positive_env_int(name: str, default: int) -> int:
+    value = int(os.environ.get(name, default))
+    if value <= 0:
+        raise ValueError(f"{name} must be positive, got {value}")
+    return value
 
 
 @torch.library.custom_op(
@@ -174,8 +210,9 @@ class Exl3Config(QuantizationConfig):
         self.version = version
         self.tensor_storage = tensor_storage or {}
         self._eager_checked = False
+        self.rank_sliced_metadata: dict[str, Any] | None = None
 
-    def get_name(self) -> str:
+    def get_name(self) -> QuantizationMethods:
         return "exl3"
 
     def get_supported_act_dtypes(self) -> list[torch.dtype]:
@@ -201,12 +238,35 @@ class Exl3Config(QuantizationConfig):
             tensor_storage=config.get("tensor_storage"),
         )
 
+    @classmethod
+    def override_quantization_method(
+        cls,
+        hf_quant_cfg: dict[str, Any],
+        user_quant: str | None,
+        hf_config: PretrainedConfig | None = None,
+    ) -> QuantizationMethods | None:
+        del hf_quant_cfg
+        if user_quant is not None and user_quant != "exl3":
+            return None
+        metadata = getattr(hf_config, "hybrid_tr3_tail", None)
+        if isinstance(metadata, dict) and metadata.get("format") == _RANK_SLICED_FORMAT:
+            return "exl3"
+        return None
+
     def maybe_update_config(
         self,
         model_name: str,
         hf_config: PretrainedConfig | None = None,
         revision: str | None = None,
     ) -> None:
+        rank_sliced = getattr(hf_config, "hybrid_tr3_tail", None)
+        if (
+            isinstance(rank_sliced, dict)
+            and rank_sliced.get("format") == _RANK_SLICED_FORMAT
+        ):
+            self._configure_rank_sliced(rank_sliced)
+            return
+
         # vLLM returns the summary embedded in config.json without consulting
         # get_config_filenames().  Hydrate the per-module records explicitly.
         if not self.tensor_storage:
@@ -232,6 +292,46 @@ class Exl3Config(QuantizationConfig):
 
         self._validate_storage_metadata()
         self._force_independent_lm_head(hf_config)
+
+    def _configure_rank_sliced(self, metadata: dict[str, Any]) -> None:
+        required = {
+            "bits",
+            "codebook",
+            "experts_per_layer",
+            "moe_layers",
+            "tensor_schema",
+            "tp",
+        }
+        missing = sorted(required.difference(metadata))
+        if missing:
+            raise ValueError(
+                "rank-sliced EXL3 metadata is missing: " + ", ".join(missing)
+            )
+        if metadata["codebook"] != "mcg":
+            raise ValueError(
+                "rank-sliced EXL3 currently requires the MCG codebook, got "
+                f"{metadata['codebook']!r}"
+            )
+        layers = metadata["moe_layers"]
+        if (
+            not isinstance(layers, list)
+            or len(layers) != 2
+            or int(layers[0]) < 0
+            or int(layers[1]) < int(layers[0])
+        ):
+            raise ValueError("rank-sliced EXL3 moe_layers must be [first, last]")
+        expected_schema = (
+            "model.layers.{L}.mlp.experts.{E}.{proj}.rank{r}.{trellis|suh|svh|mcg}"
+        )
+        if metadata["tensor_schema"] != expected_schema:
+            raise ValueError(
+                "unsupported rank-sliced EXL3 tensor schema: "
+                f"{metadata['tensor_schema']!r}"
+            )
+        self.rank_sliced_metadata = dict(metadata)
+        self.bits = float(metadata["bits"])
+        self.codebook = str(metadata["codebook"])
+        self.version = str(metadata.get("exllamav3_version", "rank-sliced"))
 
     def apply_vllm_mapper(self, hf_to_vllm_mapper: WeightsMapper) -> None:
         # Keep both spellings: loader prefixes use vLLM names, while packed
@@ -285,6 +385,10 @@ class Exl3Config(QuantizationConfig):
             )
 
     def _require_enforce_eager(self) -> None:
+        if self.rank_sliced_metadata is not None:
+            # The routed-expert fast path is eagerly planned before graph
+            # capture. Only its large-M parity fallback remains eager.
+            return
         # exllamav3_ext's exl3_gemm autotunes with timing launches on the first
         # call per (m-bucket, k, n, K) shape hash; under CUDA-graph capture
         # those launches fault, and m-bucketing means a warmup pass cannot
@@ -316,7 +420,7 @@ class Exl3Config(QuantizationConfig):
                 return UnquantizedLinearMethod()
             return Exl3LinearMethod(self)
         if isinstance(layer, RoutedExperts):
-            if not self._moe_prefix_is_exl3(prefix):
+            if not self._moe_prefix_is_exl3(prefix, layer):
                 return None
             return Exl3MoEMethod(self, layer.moe_config)
         return None
@@ -328,11 +432,13 @@ class Exl3Config(QuantizationConfig):
         else:
             candidates.append(f"model.{prefix}")
 
-        # Multimodal wrappers often add an extra `.model` or
-        # `.language_model` segment relative to vLLM's text-only module.
+        # Multimodal wrappers often add an extra `model` or `language_model`
+        # segment relative to vLLM's text-only module — interior
+        # (`model.language_model.layers...`) or leading
+        # (`language_model.lm_head`), so leading segments collapse too.
         parts = prefix.split(".")
         for removable in ("model", "language_model"):
-            for idx in range(1, len(parts) - 1):
+            for idx in range(0, len(parts) - 1):
                 if parts[idx] != removable:
                     continue
                 collapsed = ".".join(parts[:idx] + parts[idx + 1 :])
@@ -363,17 +469,43 @@ class Exl3Config(QuantizationConfig):
             for source in source_leaves
         )
 
-    def _moe_prefix_is_exl3(self, prefix: str) -> bool:
+    def _moe_prefix_is_exl3(
+        self, prefix: str, layer: torch.nn.Module | None = None
+    ) -> bool:
+        if self.rank_sliced_metadata is not None:
+            match = re.search(r"layers\.(\d+)\b", prefix)
+            if match is None:
+                return False
+            first, last = (int(v) for v in self.rank_sliced_metadata["moe_layers"])
+            return first <= int(match.group(1)) <= last
+        # Use the layer's checkpoint projection names (the same fields
+        # _validate_codebooks keys off) so remapped-projection MoE
+        # checkpoints are still detected; fall back to the defaults when the
+        # layer variant does not carry them.
+        projections = tuple(
+            getattr(layer, attr, default)
+            for attr, default in (
+                ("ckpt_gate_proj_name", "gate_proj"),
+                ("ckpt_up_proj_name", "up_proj"),
+                ("ckpt_down_proj_name", "down_proj"),
+            )
+        )
         expert_prefixes = (f"{prefix}.0", f"{prefix}.experts.0")
         return any(
             all(
                 self._is_exl3_prefix(f"{expert}.{projection}")
-                for projection in ("gate_proj", "up_proj", "down_proj")
+                for projection in projections
             )
             for expert in expert_prefixes
         )
 
     def codebook_for_prefix(self, prefix: str) -> str | None:
+        if self.rank_sliced_metadata is not None:
+            match = re.search(r"layers\.(\d+)\b", prefix)
+            if match is None:
+                return None
+            first, last = (int(v) for v in self.rank_sliced_metadata["moe_layers"])
+            return "mcg" if first <= int(match.group(1)) <= last else None
         entry = self._storage_entry(prefix)
         if entry is None:
             return None
@@ -386,6 +518,17 @@ class Exl3Config(QuantizationConfig):
 
     def has_quantized_lm_head(self) -> bool:
         return self._is_exl3_prefix("lm_head")
+
+    def normalize_rank_sliced_weight_name(self, name: str) -> str | None:
+        """Drop non-local TP payloads and remove the serialized rank segment."""
+        if self.rank_sliced_metadata is None:
+            return name
+        match = _RANK_SLICED_WEIGHT_RE.match(name)
+        if match is None:
+            return name
+        if int(match.group("rank")) != get_tensor_model_parallel_rank():
+            return None
+        return f"{match.group('prefix')}.{match.group('field')}"
 
 
 class Exl3Parameter(BasevLLMParameter):
@@ -790,15 +933,80 @@ class Exl3LinearMethod(LinearMethodBase):
 
 
 class Exl3MoEParameter(BasevLLMParameter):
-    """Zero-sized parameter holding EXL3 tensors by expert and projection."""
+    """EXL3 tensors keyed by expert/projection, optionally in one GPU slab."""
 
-    def __new__(cls, *, weight_loader):
+    def __new__(
+        cls,
+        *,
+        weight_loader,
+        num_experts: int = 0,
+        shard_ids: tuple[str, ...] = (),
+        preallocate: bool = False,
+    ):
+        del num_experts, shard_ids, preallocate
         data = torch.empty(0, dtype=torch.uint8)
         return super().__new__(cls, data=data, weight_loader=weight_loader)
 
-    def __init__(self, *, weight_loader):
+    def __init__(
+        self,
+        *,
+        weight_loader,
+        num_experts: int = 0,
+        shard_ids: tuple[str, ...] = (),
+        preallocate: bool = False,
+    ):
         self.exl3_tensors: dict[tuple[int, str], torch.Tensor] = {}
+        self.exl3_backing: torch.Tensor | None = None
+        self.exl3_num_experts = int(num_experts)
+        self.exl3_shard_ids = tuple(shard_ids)
+        self.exl3_preallocate = bool(preallocate)
         super().__init__(data=self.data, weight_loader=weight_loader)
+
+    def load_exl3_weight(
+        self,
+        loaded_weight: torch.Tensor,
+        *,
+        expert_id: int,
+        shard_id: str,
+    ) -> None:
+        key = (int(expert_id), str(shard_id))
+        if not self.exl3_preallocate:
+            self.exl3_tensors[key] = loaded_weight.contiguous()
+            return
+        if self.exl3_num_experts <= 0 or shard_id not in self.exl3_shard_ids:
+            raise ValueError(
+                f"invalid EXL3 slab key expert={expert_id}, shard={shard_id!r}"
+            )
+        if not 0 <= int(expert_id) < self.exl3_num_experts:
+            raise ValueError(
+                f"EXL3 expert {expert_id} is outside [0, {self.exl3_num_experts})"
+            )
+        if self.device.type == "meta":
+            raise RuntimeError("rank-sliced EXL3 slabs cannot be allocated on meta")
+        if self.exl3_backing is None:
+            prefix = (
+                (len(self.exl3_shard_ids), self.exl3_num_experts)
+                if len(self.exl3_shard_ids) > 1
+                else (self.exl3_num_experts,)
+            )
+            self.exl3_backing = torch.empty(
+                prefix + tuple(loaded_weight.shape),
+                dtype=loaded_weight.dtype,
+                device=self.device,
+            )
+        shard_index = self.exl3_shard_ids.index(shard_id)
+        target = (
+            self.exl3_backing[shard_index, expert_id]
+            if len(self.exl3_shard_ids) > 1
+            else self.exl3_backing[expert_id]
+        )
+        if tuple(target.shape) != tuple(loaded_weight.shape):
+            raise ValueError(
+                "rank-sliced EXL3 tensor shape changed within one slab: "
+                f"expected={tuple(target.shape)}, got={tuple(loaded_weight.shape)}"
+            )
+        target.copy_(loaded_weight, non_blocking=True)
+        self.exl3_tensors[key] = target
 
 
 def _exl3_moe_weight_loader(
@@ -810,7 +1018,11 @@ def _exl3_moe_weight_loader(
     return_success: bool = False,
 ) -> bool | None:
     del weight_name
-    param.exl3_tensors[(expert_id, shard_id)] = loaded_weight.contiguous()
+    param.load_exl3_weight(
+        loaded_weight,
+        expert_id=expert_id,
+        shard_id=shard_id,
+    )
     return True if return_success else None
 
 
@@ -835,7 +1047,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ) -> None:
-        del num_experts, params_dtype, extra_weight_attrs
+        del params_dtype, extra_weight_attrs
         if self.moe.moe_parallel_config.use_ep:
             raise NotImplementedError(
                 "EXL3 correctness MoE currently supports TP but not expert parallelism"
@@ -848,11 +1060,38 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         layer.exl3_tp_size = self.moe.moe_parallel_config.tp_size
         layer.exl3_hidden_size = hidden_size
         layer.exl3_intermediate_size_per_partition = intermediate_size_per_partition
-        for prefix in ("w13", "w2"):
+        rank_sliced_metadata = self.quant_config.rank_sliced_metadata
+        rank_sliced = rank_sliced_metadata is not None
+        if rank_sliced_metadata is not None:
+            checkpoint_tp = int(rank_sliced_metadata["tp"])
+            if checkpoint_tp != layer.exl3_tp_size:
+                raise ValueError(
+                    "rank-sliced EXL3 checkpoint TP does not match runtime: "
+                    f"checkpoint={checkpoint_tp}, runtime={layer.exl3_tp_size}"
+                )
+            expected_experts = int(rank_sliced_metadata["experts_per_layer"])
+            if expected_experts != num_experts:
+                raise ValueError(
+                    "rank-sliced EXL3 expert count does not match the model: "
+                    f"checkpoint={expected_experts}, model={num_experts}"
+                )
+            vllm_config = get_current_vllm_config_or_none()
+            scheduler_config = (
+                vllm_config.scheduler_config if vllm_config is not None else None
+            )
+            layer.exl3_max_num_batched_tokens = int(
+                getattr(scheduler_config, "max_num_batched_tokens", 4096)
+            )
+        for prefix, shard_ids in (("w13", ("w1", "w3")), ("w2", ("w2",))):
             for suffix in ("suh", "svh", "trellis", "mcg", "mul1"):
                 layer.register_parameter(
                     f"{prefix}_{suffix}",
-                    Exl3MoEParameter(weight_loader=_exl3_moe_weight_loader),
+                    Exl3MoEParameter(
+                        weight_loader=_exl3_moe_weight_loader,
+                        num_experts=num_experts,
+                        shard_ids=shard_ids,
+                        preallocate=rank_sliced and suffix in {"suh", "svh", "trellis"},
+                    ),
                 )
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
@@ -872,7 +1111,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 + (" ..." if len(missing) > 32 else "")
             )
         self._validate_codebooks(layer)
-        self._shard_tensors_for_tensor_parallel(layer)
+        if self.quant_config.rank_sliced_metadata is None:
+            self._shard_tensors_for_tensor_parallel(layer)
         device = layer.w13_trellis.device
         for prefix in ("w13", "w2"):
             for attr in ("suh", "svh", "trellis", "mcg", "mul1"):
@@ -882,6 +1122,10 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                         device=device, non_blocking=True
                     ).contiguous()
         self._validate_moe_shapes(layer)
+
+        if self.quant_config.rank_sliced_metadata is not None:
+            self._prepare_rank_sliced_weights(layer)
+            return
 
     def _validate_codebooks(self, layer: RoutedExperts) -> None:
         projections = {
@@ -979,6 +1223,135 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                             f"projection={shard_id}"
                         )
 
+    @staticmethod
+    def _rank_sliced_backing(
+        layer: RoutedExperts,
+        param_name: str,
+    ) -> torch.Tensor:
+        param = getattr(layer, param_name)
+        backing = param.exl3_backing
+        if backing is None or not backing.is_contiguous():
+            raise RuntimeError(
+                f"rank-sliced EXL3 parameter {param_name} has no contiguous slab"
+            )
+        for (expert_id, shard_id), tensor in param.exl3_tensors.items():
+            shard_index = param.exl3_shard_ids.index(shard_id)
+            expected = (
+                backing[shard_index, expert_id]
+                if len(param.exl3_shard_ids) > 1
+                else backing[expert_id]
+            )
+            if tensor.data_ptr() != expected.data_ptr():
+                raise RuntimeError(
+                    "rank-sliced EXL3 expert payload lost its slab alias: "
+                    f"{param_name}[{expert_id},{shard_id}]"
+                )
+        return backing
+
+    @staticmethod
+    def _pointer_table(slab: torch.Tensor) -> torch.Tensor:
+        if slab.ndim < 2 or not slab[0].is_contiguous():
+            raise RuntimeError("EXL3 pointer-table rows must be contiguous")
+        step = slab.stride(0) * slab.element_size()
+        base = slab.data_ptr()
+        return torch.tensor(
+            [base + expert_id * step for expert_id in range(slab.shape[0])],
+            dtype=torch.int64,
+            device=slab.device,
+        )
+
+    @staticmethod
+    def _trellis_tile_config(hidden_size: int, intermediate_size: int):
+        if hidden_size % 128 or intermediate_size % 128:
+            raise ValueError(
+                "rank-sliced EXL3 full rotations require hidden and "
+                "intermediate dimensions divisible by 128"
+            )
+        if hidden_size % 256 == 0 and intermediate_size % 256 == 0:
+            return (64, 256, 64, 256)
+        return (64, 128, 64, 128)
+
+    def _prepare_rank_sliced_weights(self, layer: RoutedExperts) -> None:
+        api = _load_sparkinfer_trellis()
+        num_experts = int(layer.local_num_experts)
+        hidden_size = int(layer.exl3_hidden_size)
+        intermediate_size = int(layer.exl3_intermediate_size_per_partition)
+        bits = int(self.quant_config.bits or 0)
+        if float(bits) != self.quant_config.bits or bits not in (3, 4, 5, 6):
+            raise ValueError(
+                "rank-sliced EXL3 requires an integral 3/4/5/6 bitrate, got "
+                f"{self.quant_config.bits!r}"
+            )
+
+        w13 = self._rank_sliced_backing(layer, "w13_trellis")
+        w2 = self._rank_sliced_backing(layer, "w2_trellis")
+        gate_suh, up_suh = self._rank_sliced_backing(layer, "w13_suh")
+        gate_svh, up_svh = self._rank_sliced_backing(layer, "w13_svh")
+        down_suh = self._rank_sliced_backing(layer, "w2_suh")
+        down_svh = self._rank_sliced_backing(layer, "w2_svh")
+        expected_w13 = (
+            2,
+            num_experts,
+            hidden_size // 16,
+            intermediate_size // 16,
+            16 * bits,
+        )
+        expected_w2 = (
+            num_experts,
+            intermediate_size // 16,
+            hidden_size // 16,
+            16 * bits,
+        )
+        if tuple(w13.shape) != expected_w13 or tuple(w2.shape) != expected_w2:
+            raise ValueError(
+                "rank-sliced EXL3 slab geometry mismatch: "
+                f"w13={tuple(w13.shape)}, w2={tuple(w2.shape)}, "
+                f"expected={expected_w13}/{expected_w2}"
+            )
+
+        intermediate_rotations = torch.empty(
+            (num_experts, 3 * intermediate_size),
+            dtype=torch.float16,
+            device=w13.device,
+        )
+        intermediate_rotations[:, :intermediate_size].copy_(gate_svh)
+        intermediate_rotations[:, intermediate_size : 2 * intermediate_size].copy_(
+            up_svh
+        )
+        intermediate_rotations[:, 2 * intermediate_size :].copy_(down_suh)
+        tile_config = self._trellis_tile_config(hidden_size, intermediate_size)
+        marker = layer.w13_mcg.exl3_tensors[(0, "w1")]
+        layer.exl3_trellis_weights = api.prepare_weights(
+            w13,
+            w2,
+            gate_suh=gate_suh,
+            up_suh=up_suh,
+            intermediate_rotations=intermediate_rotations,
+            down_svh=down_svh,
+            codebook="mcg",
+            mcg=marker,
+            tile_config=tile_config,
+        )
+
+        slabs = (
+            w13[0],
+            gate_suh,
+            gate_svh,
+            w13[1],
+            up_suh,
+            up_svh,
+            w2,
+            down_suh,
+            down_svh,
+        )
+        layer.exl3_pointer_tables = tuple(self._pointer_table(slab) for slab in slabs)
+        layer.exl3_expert_map = torch.arange(
+            num_experts,
+            dtype=torch.int64,
+            device=w13.device,
+        )
+        layer.exl3_trellis_tile_config = tile_config
+
     def get_fused_moe_quant_config(
         self, layer: RoutedExperts
     ) -> FusedMoEQuantConfig | None:
@@ -988,6 +1361,282 @@ class Exl3MoEMethod(FusedMoEMethodBase):
     @property
     def topk_indices_dtype(self) -> torch.dtype | None:
         return torch.long
+
+    def _rank_sliced_runtime(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> dict[str, Any]:
+        min_trellis_m = _positive_env_int("VLLM_EXL3_TRELLIS_MIN_M", 4)
+        max_trellis_m = _positive_env_int("VLLM_EXL3_TRELLIS_MAX_M", 32)
+        block_m = _positive_env_int("VLLM_EXL3_TRELLIS_BLOCK_M", 8)
+        chunk = _positive_env_int("VLLM_EXL3_PREFILL_CHUNK", 128)
+        if min_trellis_m > max_trellis_m:
+            raise ValueError(
+                "VLLM_EXL3_TRELLIS_MIN_M cannot exceed VLLM_EXL3_TRELLIS_MAX_M"
+            )
+        max_batched_tokens = max(
+            int(layer.exl3_max_num_batched_tokens),
+            int(x.shape[0]),
+        )
+        topk = int(topk_ids.shape[1])
+        device_index = x.device.index
+        key = (
+            device_index,
+            x.dtype,
+            int(layer.exl3_hidden_size),
+            int(layer.exl3_intermediate_size_per_partition),
+            int(layer.local_num_experts),
+            topk,
+            max_batched_tokens,
+            min_trellis_m,
+            max_trellis_m,
+            block_m,
+            chunk,
+            layer.exl3_trellis_tile_config,
+        )
+        runtime = _RANK_SLICED_RUNTIMES.get(key)
+        if runtime is not None:
+            return runtime
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "Rank-sliced EXL3 runtime must be planned during the eager "
+                "profile pass before CUDA graph capture"
+            )
+
+        trellis_bits = self.quant_config.bits
+        if trellis_bits is None:
+            raise RuntimeError("Rank-sliced EXL3 runtime has no configured bitrate")
+        api = _load_sparkinfer_trellis()
+        caps = api.Caps(
+            max_tokens=max_trellis_m,
+            num_topk=topk,
+            num_experts=int(layer.local_num_experts),
+            hidden_size=int(layer.exl3_hidden_size),
+            intermediate_size=int(layer.exl3_intermediate_size_per_partition),
+            route_num_experts=int(layer.local_num_experts),
+            block_size_m=block_m,
+            trellis_bits=int(trellis_bits),
+            tile_config=layer.exl3_trellis_tile_config,
+            input_dtype=x.dtype,
+            device=x.device,
+        )
+        trellis_plan = api.plan(caps)
+        scratch_spec = trellis_plan.scratch_specs()[0]
+        trellis_scratch = torch.empty(
+            scratch_spec.shape,
+            dtype=scratch_spec.dtype,
+            device=scratch_spec.device,
+        )
+
+        ext = _load_exl3_ext()
+        required_ext = {
+            "exl3_moe",
+            "exl3_moe_max_concurrency",
+        }
+        missing_ext = sorted(name for name in required_ext if not hasattr(ext, name))
+        if missing_ext:
+            raise RuntimeError(
+                "The EXL3 extension lacks routed-expert entry points: "
+                + ", ".join(missing_ext)
+            )
+        concurrency = int(
+            ext.exl3_moe_max_concurrency(torch.accelerator.current_device_index())
+        )
+        hidden_size = int(layer.exl3_hidden_size)
+        intermediate_size = int(layer.exl3_intermediate_size_per_partition)
+        num_experts = int(layer.local_num_experts)
+        device = x.device
+        runtime = {
+            "api": api,
+            "trellis_plan": trellis_plan,
+            "trellis_scratch": trellis_scratch,
+            "ext": ext,
+            "min_trellis_m": min_trellis_m,
+            "max_trellis_m": max_trellis_m,
+            "max_batched_tokens": max_batched_tokens,
+            "topk": topk,
+            "chunk": chunk,
+            "xh": torch.empty(
+                (max_batched_tokens, hidden_size),
+                dtype=torch.float16,
+                device=device,
+            ),
+            "out32": torch.empty(
+                (max_batched_tokens, hidden_size),
+                dtype=torch.float32,
+                device=device,
+            ),
+            "tg": torch.empty(
+                (concurrency, chunk, hidden_size),
+                dtype=torch.float16,
+                device=device,
+            ),
+            "tu": torch.empty(
+                (concurrency, chunk, hidden_size),
+                dtype=torch.float16,
+                device=device,
+            ),
+            "ig": torch.empty(
+                (concurrency, chunk, intermediate_size),
+                dtype=torch.float16,
+                device=device,
+            ),
+            "iu": torch.empty(
+                (concurrency, chunk, intermediate_size),
+                dtype=torch.float16,
+                device=device,
+            ),
+            "expert_count": torch.empty(
+                num_experts + 1,
+                dtype=torch.int64,
+                device=device,
+            ),
+            "expert_offsets": torch.empty(
+                num_experts + 1,
+                dtype=torch.int64,
+                device=device,
+            ),
+            "token_sorted": torch.empty(
+                max_batched_tokens * topk,
+                dtype=torch.int64,
+                device=device,
+            ),
+            "weight_sorted": torch.empty(
+                max_batched_tokens * topk,
+                dtype=torch.float16,
+                device=device,
+            ),
+            "flat_token": torch.arange(
+                chunk,
+                dtype=torch.int64,
+                device=device,
+            ).repeat_interleave(topk),
+            "ones": torch.ones(
+                chunk * topk,
+                dtype=torch.int64,
+                device=device,
+            ),
+        }
+        _RANK_SLICED_RUNTIMES[key] = runtime
+        logger.info_once(
+            "EXL3 rank-sliced runtime planned: Trellis m=%d..%d block_m=%d, "
+            "prefill capacity=%d chunk=%d topk=%d",
+            min_trellis_m,
+            max_trellis_m,
+            block_m,
+            max_batched_tokens,
+            chunk,
+            topk,
+        )
+        return runtime
+
+    def _apply_rank_sliced(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        runtime = self._rank_sliced_runtime(layer, x, topk_ids)
+        m = int(x.shape[0])
+        if runtime["min_trellis_m"] <= m <= runtime["max_trellis_m"]:
+            binding = runtime["api"].bind(
+                runtime["trellis_plan"],
+                scratch=runtime["trellis_scratch"],
+                a=x,
+                weights=layer.exl3_trellis_weights,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+            )
+            output = runtime["api"].run(binding=binding)
+            return output.to(x.dtype).clone()
+
+        if m > runtime["max_batched_tokens"]:
+            raise ValueError(
+                "EXL3 batch exceeds its planned capacity: "
+                f"m={m}, capacity={runtime['max_batched_tokens']}"
+            )
+        ext = runtime["ext"]
+        xh = runtime["xh"][:m]
+        xh.copy_(x)
+        out32 = runtime["out32"][:m]
+        out32.zero_()
+        chunk = int(runtime["chunk"])
+        pointer_args = layer.exl3_pointer_tables
+        if m > chunk and hasattr(ext, "exl3_moe_fused"):
+            ext.exl3_moe_fused(
+                xh,
+                out32,
+                topk_ids,
+                topk_weights,
+                layer.exl3_expert_map,
+                runtime["expert_count"],
+                runtime["expert_offsets"],
+                runtime["token_sorted"],
+                runtime["weight_sorted"],
+                runtime["tg"],
+                runtime["tu"],
+                runtime["ig"],
+                runtime["iu"],
+                0,
+                3,
+                3,
+                3,
+                *pointer_args,
+                True,
+                False,
+                True,
+                False,
+                True,
+                False,
+                0.0,
+                0,
+            )
+            return out32.to(x.dtype).clone()
+
+        local_ids = layer.exl3_expert_map[topk_ids.long()]
+        half_weights = topk_weights.to(torch.float16)
+        topk = int(runtime["topk"])
+        for start in range(0, m, chunk):
+            current_m = min(chunk, m - start)
+            flat = local_ids[start : start + current_m].reshape(-1)
+            order = torch.argsort(flat)
+            route_count = current_m * topk
+            token_ids = runtime["flat_token"][:route_count].index_select(0, order)
+            route_weights = (
+                half_weights[start : start + current_m]
+                .reshape(-1)
+                .index_select(0, order)
+            )
+            counts = runtime["expert_count"]
+            counts.zero_()
+            counts.scatter_add_(0, flat, runtime["ones"][:route_count])
+            ext.exl3_moe(
+                xh[start : start + current_m],
+                out32[start : start + current_m],
+                counts,
+                token_ids,
+                route_weights,
+                runtime["tg"],
+                runtime["tu"],
+                runtime["ig"],
+                runtime["iu"],
+                0,
+                3,
+                3,
+                3,
+                *pointer_args,
+                True,
+                False,
+                True,
+                False,
+                True,
+                False,
+                0.0,
+            )
+        return out32.to(x.dtype).clone()
 
     def apply(
         self,
@@ -1012,9 +1661,16 @@ class Exl3MoEMethod(FusedMoEMethodBase):
 
         original_shape = x.shape[:-1]
         original_dtype = x.dtype
-        x_2d = x.reshape(-1, x.shape[-1]).to(torch.float16).contiguous()
-        ids = topk_ids.reshape(x_2d.shape[0], -1).to(torch.long)
-        weights = topk_weights.reshape_as(ids).to(torch.float16)
+        x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+        ids = topk_ids.reshape(x_2d.shape[0], -1).contiguous()
+        weights = topk_weights.reshape_as(ids).to(torch.float32).contiguous()
+        if self.quant_config.rank_sliced_metadata is not None:
+            output = self._apply_rank_sliced(layer, x_2d, weights, ids)
+            return output.reshape(*original_shape, output.shape[-1])
+
+        x_2d = x_2d.to(torch.float16)
+        ids = ids.to(torch.long)
+        weights = weights.to(torch.float16)
         output = torch.zeros(
             (x_2d.shape[0], layer.hidden_size),
             dtype=torch.float32,
