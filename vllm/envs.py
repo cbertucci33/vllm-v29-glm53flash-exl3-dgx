@@ -2170,6 +2170,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Each op additionally checks its own shape / dtype constraints and falls
     # back to the eager path when they do not hold.
     "VLLM_ENABLE_HPC_OPS": lambda: bool(int(os.getenv("VLLM_ENABLE_HPC_OPS", "0"))),
+    # --- EXL3 Trellis MoE runtime knobs (read directly by
+    # model_executor/layers/quantization/exl3.py; registered here so startup
+    # does not flag them as unknown). All are passthrough: consuming code
+    # applies its own context-dependent defaults (e.g. the Trellis window
+    # minimum defaults to MIN_CAPTURABLE_TRELLIS_M=1 for draft layers and 4
+    # for target layers when unset).
+    "VLLM_EXL3_TRELLIS_MIN_M": lambda: os.getenv("VLLM_EXL3_TRELLIS_MIN_M"),
+    "VLLM_EXL3_TRELLIS_MAX_M": lambda: os.getenv("VLLM_EXL3_TRELLIS_MAX_M"),
+    "VLLM_EXL3_TRELLIS_BLOCK_M": lambda: os.getenv("VLLM_EXL3_TRELLIS_BLOCK_M"),
+    "VLLM_EXL3_PREFILL_CHUNK": lambda: os.getenv("VLLM_EXL3_PREFILL_CHUNK"),
+    "VLLM_EXL3_PREFILL_TRELLIS": lambda: os.getenv("VLLM_EXL3_PREFILL_TRELLIS"),
+    "VLLM_EXL3_PREFILL_BLOCK_M": lambda: os.getenv("VLLM_EXL3_PREFILL_BLOCK_M"),
+    # Prebuilt exllamav3 extension location and torch-ABI compatibility shim.
+    "VLLM_EXL3_EXT_PATH": lambda: os.getenv("VLLM_EXL3_EXT_PATH"),
+    "VLLM_EXL3_ABI_SHIM": lambda: os.getenv("VLLM_EXL3_ABI_SHIM"),
+    # Calibrated MLA outer scales for the nvfp4_ds_mla KV cache.
+    "VLLM_NVFP4_MLA_SCALES_FILE": lambda: os.getenv("VLLM_NVFP4_MLA_SCALES_FILE"),
+
 }
 
 
