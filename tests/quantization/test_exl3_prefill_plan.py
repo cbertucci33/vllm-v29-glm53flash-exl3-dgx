@@ -113,6 +113,9 @@ class _Harness:
         self.api = _FakeTrellisApi()
         self.ext = _FakeExt()
 
+    def planned_caps(self):
+        return self.api.planned
+
     def __enter__(self):
         for name, value in self._env.items():
             self._saved_env[name] = os.environ.get(name)
@@ -128,8 +131,8 @@ class _Harness:
         exl3_module._load_exl3_ext = lambda: self.ext
         self._saved_capturing = torch.cuda.is_current_stream_capturing
         torch.cuda.is_current_stream_capturing = lambda: False
-        self._saved_current_device = torch.cuda.current_device
-        torch.cuda.current_device = lambda: 0
+        self._saved_current_device_index = torch.accelerator.current_device_index
+        torch.accelerator.current_device_index = lambda: 0
         exl3_module._RANK_SLICED_RUNTIMES.clear()
         return self
 
@@ -139,7 +142,7 @@ class _Harness:
             exl3_module._load_exl3_ext,
         ) = self._saved_loaders
         torch.cuda.is_current_stream_capturing = self._saved_capturing
-        torch.cuda.current_device = self._saved_current_device
+        torch.accelerator.current_device_index = self._saved_current_device_index
         for name, value in self._saved_env.items():
             if value is None:
                 os.environ.pop(name, None)
@@ -225,6 +228,31 @@ def test_prefill_block_m_env_override():
         assert h.api.bound[-1][0].caps["max_tokens"] == MAX_BATCHED
 
 
+def test_parity_window_capacity_is_validated_before_planning():
+    env = {
+        "VLLM_EXL3_TRELLIS_MIN_M": "160",
+        "VLLM_EXL3_TRELLIS_MAX_M": "192",
+        "VLLM_EXL3_PREFILL_CHUNK": "128",
+    }
+    with _Harness(env=env) as h:
+        with pytest.raises(ValueError, match="cannot cover the EXL3 parity window"):
+            _apply(_make_method(), _make_layer(), 16)
+        assert not h.planned_caps()
+
+
+def test_disabled_prefill_plan_keeps_full_parity_capacity():
+    env = {
+        "VLLM_EXL3_TRELLIS_MIN_M": "160",
+        "VLLM_EXL3_TRELLIS_MAX_M": "192",
+        "VLLM_EXL3_PREFILL_CHUNK": "128",
+        "VLLM_EXL3_PREFILL_TRELLIS": "0",
+    }
+    with _Harness(env=env):
+        _apply(_make_method(), _make_layer(), 159)
+        runtime = next(iter(exl3_module._RANK_SLICED_RUNTIMES.values()))
+        assert runtime["parity_rows"] == MAX_BATCHED
+
+
 def test_parity_path_guarded_against_capture():
     with _Harness() as h:
         method = _make_method()
@@ -243,16 +271,6 @@ def test_parity_path_guarded_against_capture():
             assert "capture" in str(err)
         else:
             raise AssertionError("parity path must raise during capture")
-
-
-def _install_planned_caps_helper():
-    def planned_caps(self):
-        return self.api.planned
-
-    _Harness.planned_caps = planned_caps
-
-
-_install_planned_caps_helper()
 
 
 if __name__ == "__main__":
