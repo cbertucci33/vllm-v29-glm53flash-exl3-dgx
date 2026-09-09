@@ -24,11 +24,11 @@ from typing import TYPE_CHECKING, Any
 import torch
 from transformers import PretrainedConfig
 
+from vllm.config import get_current_vllm_config_or_none
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from vllm.config import get_current_vllm_config_or_none
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEMethodBase,
@@ -192,7 +192,7 @@ class Exl3Config(QuantizationConfig):
         return ["quantization_config.json"]
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> "Exl3Config":
+    def from_config(cls, config: dict[str, Any]) -> Exl3Config:
         return cls(
             bits=config.get("bits"),
             head_bits=config.get("head_bits"),
@@ -233,7 +233,7 @@ class Exl3Config(QuantizationConfig):
         self._validate_storage_metadata()
         self._force_independent_lm_head(hf_config)
 
-    def apply_vllm_mapper(self, hf_to_vllm_mapper: "WeightsMapper") -> None:
+    def apply_vllm_mapper(self, hf_to_vllm_mapper: WeightsMapper) -> None:
         # Keep both spellings: loader prefixes use vLLM names, while packed
         # source-matrix discovery intentionally refers to the unstacked HF name.
         mapped = hf_to_vllm_mapper.apply_dict(self.tensor_storage)
@@ -995,7 +995,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         x: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
-        shared_experts: "SharedExperts | None",
+        shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
         del shared_experts, shared_experts_input
