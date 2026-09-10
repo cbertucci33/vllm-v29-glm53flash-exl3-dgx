@@ -21,7 +21,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-
 import vllm.model_executor.layers.quantization.exl3 as exl3_module
 from vllm.model_executor.layers.quantization.exl3 import Exl3MoEMethod
 
@@ -178,12 +177,15 @@ def test_dual_plan_construction_and_dispatch():
         assert not h.ext.moe_calls
 
         _apply(method, layer, 2)
-        assert h.ext.moe_calls == [(2, 2)]
+        assert h.api.bound[-1][0].caps["max_tokens"] == 32
+        assert h.api.bound[-1][1] == 2
+        assert not h.ext.moe_calls
 
         runtime = next(iter(exl3_module._RANK_SLICED_RUNTIMES.values()))
-        assert runtime["parity_rows"] == 128
-        assert runtime["xh"].shape[0] == 128
-        assert runtime["token_sorted"].numel() == 128 * TOPK
+        assert runtime["parity_rows"] == 0
+        assert runtime["ext"] is None
+        assert runtime["xh"].shape[0] == 0
+        assert runtime["token_sorted"].numel() == 0
 
         # Batches above the scheduler contract must fail before allocating a
         # replacement runtime or a larger Trellis arena during serving.
@@ -198,6 +200,24 @@ def test_dual_plan_construction_and_dispatch():
         assert tuple(exl3_module._RANK_SLICED_RUNTIMES) == runtime_keys
         assert len(exl3_module._RANK_SLICED_RUNTIMES) == runtime_count
         assert len(h.planned_caps()) == plan_count
+
+
+@pytest.mark.parametrize("is_draft", [False, True])
+@pytest.mark.parametrize("m", [1, 2, 3, 4, 32])
+def test_default_capture_window_covers_target_and_draft_small_rows(is_draft, m):
+    with _Harness() as h:
+        method = _make_method()
+        layer = _make_layer()
+        layer.exl3_is_draft = is_draft
+
+        _apply(method, layer, m)
+
+        assert h.api.bound[-1][0].caps["max_tokens"] == 32
+        assert h.api.bound[-1][1] == m
+        assert not h.ext.moe_calls
+        runtime = next(iter(exl3_module._RANK_SLICED_RUNTIMES.values()))
+        assert runtime["min_trellis_m"] == 1
+        assert runtime["ext"] is None
 
 
 def test_prefill_trellis_disabled_restores_parity():
@@ -253,8 +273,8 @@ def test_disabled_prefill_plan_keeps_full_parity_capacity():
         assert runtime["parity_rows"] == MAX_BATCHED
 
 
-def test_parity_path_guarded_against_capture():
-    with _Harness() as h:
+def test_explicit_parity_path_guarded_against_capture():
+    with _Harness(env={"VLLM_EXL3_TRELLIS_MIN_M": "4"}) as h:
         method = _make_method()
         layer = _make_layer()
         # Plan eagerly, then flip into "capturing" state.
@@ -277,5 +297,5 @@ if __name__ == "__main__":
     test_dual_plan_construction_and_dispatch()
     test_prefill_trellis_disabled_restores_parity()
     test_prefill_block_m_env_override()
-    test_parity_path_guarded_against_capture()
+    test_explicit_parity_path_guarded_against_capture()
     print("EXL3_PREFILL_PLAN_TESTS_OK")

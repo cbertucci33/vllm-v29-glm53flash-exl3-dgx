@@ -78,8 +78,10 @@ _NEXT_RUNTIME_SCOPE_ID = 0
 # instead of failing at capture time.
 MIN_CAPTURABLE_TRELLIS_M = 1
 
-# Historical default for non-captured (target) layers.
-_DEFAULT_TRELLIS_MIN_M = 4
+# Target execution also reaches m=1..3 during profiling and small-batch decode.
+# Keep every supported row count on the native path by default; operators may
+# still raise the threshold explicitly as a diagnostic kill switch.
+_DEFAULT_TRELLIS_MIN_M = MIN_CAPTURABLE_TRELLIS_M
 
 
 def _is_draft_layer(layer: Any) -> bool:
@@ -1484,26 +1486,20 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         x: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> dict[str, Any]:
-        # A rank-sliced draft layer is CUDA-graph captured at small row counts
-        # (m = draft rows per step, typically 1..3). If m falls outside the
-        # Trellis window the eager parity path is reached, which is illegal
-        # during capture -- the engine then cannot start at all:
+        # Rank-sliced target and draft layers both reach small row counts
+        # (typically m=1..3) during profiling, decode, or CUDA-graph capture. If
+        # m falls outside the Trellis window the eager parity path is reached;
+        # under capture that is illegal and the engine cannot start:
         #
         #   RuntimeError: EXL3 eager parity path entered during CUDA graph
         #   capture (m=3); capture sizes must lie inside the Trellis window
         #   [4, 32]
         #
-        # That was previously worked around by asking every operator to set
-        # VLLM_EXL3_TRELLIS_MIN_M=1 by hand. A backend should satisfy its own
-        # capture contract instead, so draft layers default the window down to
-        # MIN_CAPTURABLE_TRELLIS_M. An explicit env value still wins, and the
-        # target path keeps its original default.
-        default_min_m = (
-            MIN_CAPTURABLE_TRELLIS_M
-            if _is_draft_layer(layer)
-            else _DEFAULT_TRELLIS_MIN_M
+        # The backend therefore owns one capability-based default for both
+        # roles. An explicit env value remains authoritative for diagnostics.
+        min_trellis_m = _positive_env_int(
+            "VLLM_EXL3_TRELLIS_MIN_M", _DEFAULT_TRELLIS_MIN_M
         )
-        min_trellis_m = _positive_env_int("VLLM_EXL3_TRELLIS_MIN_M", default_min_m)
         max_trellis_m = _positive_env_int("VLLM_EXL3_TRELLIS_MAX_M", 32)
         block_m = _positive_env_int("VLLM_EXL3_TRELLIS_BLOCK_M", 8)
         chunk = _positive_env_int("VLLM_EXL3_PREFILL_CHUNK", 128)
