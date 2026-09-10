@@ -4,8 +4,7 @@ This repository develops a GLM-5.3 Flash runner for two NVIDIA DGX Sparks. It
 starts from vanilla vLLM 0.29 and uses FlashInfer's native SM120/SM121
 `GLM53_NOPE` sparse-attention path.
 
-The repository is private while the integration and codebase audit are in
-progress. No production deployment should be built from an unaudited commit.
+No production deployment should be built from an unaudited commit.
 
 ## Baseline
 
@@ -13,8 +12,25 @@ progress. No production deployment should be built from an unaudited commit.
 - Base commit: `98dff2a81d747d1dba01a47f939f48c3526d4206`
 - Target hardware: two NVIDIA DGX Sparks using tensor parallelism over
   ConnectX-7
-- Target model: GLM-5.3 Flash with a rank-sliced EXL3 target and an MXFP8
-  DFlash2 drafter
+- Planned target model: GLM-5.3 Flash with a rank-sliced EXL3 target and an
+  MXFP8 DFlash2 drafter
+
+## Current source state
+
+This first source tranche contains only the GLM target-model baseline and its
+native SM120 sparse-MLA prerequisites:
+
+- upstream GLM-5.3 Flash support from vLLM PR #53906, retained with Jiangyun
+  Zhu's authorship;
+- GLM NoPE packed-cache support from vLLM PR #55277 commit `0fa2b3308c`;
+- physical 2,176-entry sparse page-table sizing from vLLM PR #55277 commit
+  `8d09804c87`;
+- K-pool sentinel initialization and bounds checks derived from Entrpi commit
+  `5fc13966f5`, with the unrelated SM90 compatibility changes excluded.
+
+The FlashInfer commit below is a documented build requirement only. This
+tranche does not yet package FlashInfer, EXL3, Sparkinfer, DFlash2, a drafter,
+or a launch configuration.
 
 ## Native SM120 integration
 
