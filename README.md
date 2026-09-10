@@ -17,8 +17,8 @@ No production deployment should be built from an unaudited commit.
 
 ## Current source state
 
-This first source tranche contains only the GLM target-model baseline and its
-native SM120 sparse-MLA prerequisites:
+The current source contains the GLM target-model baseline, native SM120
+sparse-MLA prerequisites, and rank-sliced EXL3 execution:
 
 - upstream GLM-5.3 Flash support from vLLM PR #53906, retained with Jiangyun
   Zhu's authorship;
@@ -26,11 +26,14 @@ native SM120 sparse-MLA prerequisites:
 - physical 2,176-entry sparse page-table sizing from vLLM PR #55277 commit
   `8d09804c87`;
 - K-pool sentinel initialization and bounds checks derived from Entrpi commit
-  `5fc13966f5`, with the unrelated SM90 compatibility changes excluded.
+  `5fc13966f5`, with unrelated SM90 compatibility changes excluded;
+- rank-sliced EXL3 loading, target and MTP weight-name normalization, and
+  planned Trellis execution through Sparkinfer PR #49 commit
+  `d4438d490691f79022fdfc8149e1c5f161d15445`.
 
-The FlashInfer commit below is a documented build requirement only. This
-tranche does not yet package FlashInfer, EXL3, Sparkinfer, DFlash2, a drafter,
-or a launch configuration.
+The FlashInfer and Sparkinfer commits below are documented build requirements.
+This source does not yet package either dependency, DFlash2, a drafter, or a
+launch configuration.
 
 ## Native SM120 integration
 
@@ -50,13 +53,14 @@ old B12X sparse-MLA backend or Entrpi's expanded physical K-pool design.
 The runner still needs work that is not part of vanilla vLLM 0.29:
 
 - upstream GLM-5.3 model support;
-- rank-sliced EXL3/Trellis execution through pinned Sparkinfer PR #49;
+- rank-sliced EXL3/Trellis execution through pinned Sparkinfer PR #49. Every
+  rank-sliced batch shape uses its planned Trellis path. This route does not
+  use the legacy ExLlamaV3 routed-expert fallback;
 - GLM DFlash2 support and the fixed non-prefix-cacheable drafter KV ring;
 - independently applicable GLM, SM121, cache, and scheduler corrections.
 
 Imported commits will retain their original author metadata and source links.
-The final repository will include a third-party notice with exact revisions and
-licenses.
+`THIRD_PARTY_NOTICES.md` records the exact revisions and licenses.
 
 ## Work authored in this repository
 

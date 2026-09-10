@@ -8,13 +8,13 @@ import torch
 
 import vllm.model_executor.layers.quantization.exl3 as exl3_module
 import vllm.model_executor.parameter as parameter_module
-from vllm.config import CompilationMode
 from vllm.model_executor.layers.quantization import get_quantization_config
 from vllm.model_executor.layers.quantization.exl3 import (
     Exl3Config,
+    Exl3MoEMethod,
     Exl3MoEParameter,
 )
-from vllm.model_executor.models import glm4_moe
+from vllm.models.glm5next.nvidia import model as glm5next_model
 
 
 def _rank_sliced_metadata(**overrides):
@@ -49,39 +49,6 @@ def test_rank_sliced_checkpoint_selects_exl3_override():
         )
         is None
     )
-
-
-def test_glm_model_retains_quant_config_for_weight_loading(monkeypatch):
-    pp_group = SimpleNamespace(is_first_rank=False, is_last_rank=False)
-    monkeypatch.setattr(glm4_moe, "get_pp_group", lambda: pp_group)
-    monkeypatch.setattr(
-        glm4_moe,
-        "make_layers",
-        lambda *args, **kwargs: (0, 0, torch.nn.ModuleList()),
-    )
-    monkeypatch.setattr(
-        glm4_moe,
-        "make_empty_intermediate_tensors_factory",
-        lambda *args, **kwargs: object(),
-    )
-    quant_config = object()
-    vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(
-            hf_config=SimpleNamespace(
-                vocab_size=1,
-                hidden_size=8,
-                num_hidden_layers=0,
-            )
-        ),
-        cache_config=object(),
-        quant_config=quant_config,
-        parallel_config=SimpleNamespace(enable_eplb=False),
-        compilation_config=SimpleNamespace(mode=CompilationMode.NONE),
-    )
-
-    model = glm4_moe.Glm4MoeModel(vllm_config=vllm_config)
-
-    assert model.quant_config is quant_config
 
 
 @pytest.mark.parametrize(
@@ -136,16 +103,15 @@ def test_rank_sliced_weight_name_keeps_only_local_tp_rank(monkeypatch):
     )
 
 
-def test_glm_model_normalizes_rank_sliced_weights_before_auto_loading(monkeypatch):
+def test_glm5next_target_normalizes_rank_sliced_weights(monkeypatch):
     observed = []
 
     class RecordingLoader:
         def __init__(self, model):
-            assert model is glm_model
+            assert model is target
 
-        def load_weights(self, weights, *, mapper):
+        def load_weights(self, weights):
             observed.extend(weights)
-            assert mapper is glm4_moe.Glm4MoeModel.hf_to_vllm_mapper
             return {name for name, _ in observed}
 
     def normalize(name: str) -> str | None:
@@ -153,43 +119,26 @@ def test_glm_model_normalizes_rank_sliced_weights_before_auto_loading(monkeypatc
             return None
         return name.replace(".rank0.", ".")
 
-    monkeypatch.setattr(glm4_moe, "AutoWeightsLoader", RecordingLoader)
-    monkeypatch.setattr(
-        glm4_moe,
-        "skip_spec_layers",
-        lambda weights, config: weights,
-    )
-    monkeypatch.setattr(
-        glm4_moe,
-        "maybe_fuse_shared_experts",
-        lambda weights, **kwargs: weights,
-    )
-    glm_model = object.__new__(glm4_moe.Glm4MoeModel)
-    torch.nn.Module.__init__(glm_model)
-    glm_model.quant_config = SimpleNamespace(
+    monkeypatch.setattr(glm5next_model, "AutoWeightsLoader", RecordingLoader)
+    target = object.__new__(glm5next_model.Glm5NextForCausalLM)
+    torch.nn.Module.__init__(target)
+    target.quant_config = SimpleNamespace(
         normalize_rank_sliced_weight_name=normalize
     )
-    glm_model.config = SimpleNamespace(n_routed_experts=2, n_shared_experts=1)
-    local = torch.tensor(1)
-    remote = torch.tensor(2)
-    ordinary = torch.tensor(3)
 
-    loaded = glm_model.load_weights(
+    loaded = target.load_weights(
         [
-            ("layers.3.mlp.experts.0.gate_proj.rank0.trellis", local),
-            ("layers.3.mlp.experts.0.gate_proj.rank1.trellis", remote),
-            ("embed_tokens.weight", ordinary),
+            ("model.layers.3.mlp.experts.0.gate_proj.rank0.trellis", torch.ones(1)),
+            ("model.layers.3.mlp.experts.0.gate_proj.rank1.trellis", torch.ones(1)),
+            ("model.embed_tokens.weight", torch.ones(1)),
         ]
     )
 
-    assert observed == [
-        ("layers.3.mlp.experts.0.gate_proj.trellis", local),
-        ("embed_tokens.weight", ordinary),
+    assert [name for name, _ in observed] == [
+        "model.layers.3.mlp.experts.0.gate_proj.trellis",
+        "model.embed_tokens.weight",
     ]
-    assert loaded == {
-        "layers.3.mlp.experts.0.gate_proj.trellis",
-        "embed_tokens.weight",
-    }
+    assert loaded == {name for name, _ in observed}
 
 
 def test_rank_sliced_parameter_preallocates_projection_major_slab(monkeypatch):
@@ -221,11 +170,74 @@ def test_rank_sliced_parameter_preallocates_projection_major_slab(monkeypatch):
     torch.testing.assert_close(param.exl3_tensors[(2, "w3")], w3)
 
 
+def test_rank_sliced_weights_use_the_planned_sparkinfer_contract(monkeypatch):
+    experts = 2
+    hidden = intermediate = 128
+    bits = 3
+    slabs = {
+        "w13_trellis": torch.zeros(
+            (2, experts, hidden // 16, intermediate // 16, 16 * bits),
+            dtype=torch.int16,
+        ),
+        "w2_trellis": torch.zeros(
+            (experts, intermediate // 16, hidden // 16, 16 * bits),
+            dtype=torch.int16,
+        ),
+        "w13_suh": torch.ones((2, experts, hidden), dtype=torch.float16),
+        "w13_svh": torch.ones((2, experts, intermediate), dtype=torch.float16),
+        "w2_suh": torch.ones((experts, intermediate), dtype=torch.float16),
+        "w2_svh": torch.ones((experts, hidden), dtype=torch.float16),
+    }
+
+    class FakeTrellis:
+        def __init__(self):
+            self.args = None
+            self.kwargs = None
+
+        def prepare_weights(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+            return object()
+
+    api = FakeTrellis()
+    monkeypatch.setattr(exl3_module, "_load_sparkinfer_trellis", lambda: api)
+    method = object.__new__(Exl3MoEMethod)
+    method.quant_config = SimpleNamespace(bits=float(bits))
+    method._rank_sliced_backing = lambda _layer, name: slabs[name]
+    marker = torch.tensor(0xCBAC1FED - (1 << 32), dtype=torch.int32)
+    layer = SimpleNamespace(
+        local_num_experts=experts,
+        exl3_hidden_size=hidden,
+        exl3_intermediate_size_per_partition=intermediate,
+        w13_mcg=SimpleNamespace(exl3_tensors={(0, "w1"): marker}),
+    )
+
+    method._prepare_rank_sliced_weights(layer)
+
+    assert api.args == (slabs["w13_trellis"], slabs["w2_trellis"])
+    assert api.kwargs is not None
+    assert set(api.kwargs) == {
+        "gate_suh",
+        "up_suh",
+        "intermediate_rotations",
+        "down_svh",
+        "codebook",
+        "mcg",
+        "tile_config",
+    }
+    assert api.kwargs["gate_suh"].data_ptr() == slabs["w13_suh"][0].data_ptr()
+    assert api.kwargs["up_suh"].data_ptr() == slabs["w13_suh"][1].data_ptr()
+    assert api.kwargs["down_svh"].data_ptr() == slabs["w2_svh"].data_ptr()
+    assert api.kwargs["mcg"] is marker
+    assert api.kwargs["codebook"] == "mcg"
+    assert api.kwargs["tile_config"] == (64, 128, 64, 128)
+
+
 def test_rank_sliced_runtime_scope_is_per_owning_model():
     """Target and rank-sliced MTP draft layers must not share a cached runtime.
 
-    The rank-sliced runtime cache stores mutable Trellis/prefill scratch and
-    parity staging buffers. A target MoE layer and an MTP draft layer of the same
+    The rank-sliced runtime cache stores mutable Trellis and prefill scratch.
+    A target MoE layer and an MTP draft layer of the same
     model have identical shapes, topk and planner settings, so a shape-only key
     would hand the draft the target's scratch and break the target/draft
     isolation their independently captured CUDA graphs depend on.
@@ -324,7 +336,8 @@ def test_rank_sliced_window_defaults_to_min_capturable_m(monkeypatch) -> None:
     assert resolved() == exl3_mod._DEFAULT_TRELLIS_MIN_M
     assert resolved() == exl3_mod.MIN_CAPTURABLE_TRELLIS_M == 1
 
-    # An explicit value remains authoritative as a diagnostic kill switch.
+    # Rank-sliced execution has no eager parity fallback. A higher floor must
+    # therefore be rejected before runtime planning.
     monkeypatch.setenv("VLLM_EXL3_TRELLIS_MIN_M", "4")
     assert resolved() == 4
 

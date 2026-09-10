@@ -4,12 +4,12 @@
 """EXL3 (ExLlamaV3 trellis) quantization support.
 
 Rank-sliced routed-expert checkpoints use Sparkinfer's planned full-rotation
-Trellis MoE API for the decode window and the ExLlamaV3 extension for larger
-prefill batches. Generic dense and non-rank-sliced MoE checkpoints use the
-bit-faithful ``exllamav3_ext.exl3_gemm`` parity path. Every logical checkpoint
-matrix is dispatched independently: vLLM's packed QKV and gate/up modules are
-not treated as one EXL3 matrix because each source matrix owns its Hadamard
-vectors and codebook marker.
+Trellis MoE API for every supported batch shape. Generic dense and
+non-rank-sliced MoE checkpoints use the bit-faithful
+``exllamav3_ext.exl3_gemm`` path. Every logical checkpoint matrix is dispatched
+independently: vLLM's packed QKV and gate/up modules are not treated as one
+EXL3 matrix because each source matrix owns its Hadamard vectors and codebook
+marker.
 
 Both dependencies are imported lazily. Importing this module, parsing
 checkpoint metadata, or compiling it with ``py_compile`` does not load either
@@ -120,8 +120,8 @@ def _runtime_owner_token(quant_config: Any, layer: Any) -> tuple[int, bool]:
 def _runtime_scope_id(quant_config: Any) -> int:
     """Stable identity for the model that owns a rank-sliced runtime.
 
-    A cached runtime owns mutable Trellis/prefill scratch plus parity staging and
-    sort buffers, so an entry must never be shared across models. A target MoE
+    A cached runtime owns mutable Trellis and prefill scratch, so an entry must
+    never be shared across models. A target MoE
     layer and a rank-sliced MTP draft layer have identical shapes, topk and
     planner settings -- both read ``max_num_batched_tokens`` from the same
     scheduler config -- so a shape-only key makes the draft reuse the target's
@@ -479,8 +479,7 @@ class Exl3Config(QuantizationConfig):
 
     def _require_enforce_eager(self) -> None:
         if self.rank_sliced_metadata is not None:
-            # The routed-expert fast path is eagerly planned before graph
-            # capture. Only its large-M parity fallback remains eager.
+            # The routed-expert path is eagerly planned before graph capture.
             return
         # exllamav3_ext's exl3_gemm autotunes with timing launches on the first
         # call per (m-bucket, k, n, K) shape hash; under CUDA-graph capture
@@ -1451,23 +1450,6 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             tile_config=tile_config,
         )
 
-        slabs = (
-            w13[0],
-            gate_suh,
-            gate_svh,
-            w13[1],
-            up_suh,
-            up_svh,
-            w2,
-            down_suh,
-            down_svh,
-        )
-        layer.exl3_pointer_tables = tuple(self._pointer_table(slab) for slab in slabs)
-        layer.exl3_expert_map = torch.arange(
-            num_experts,
-            dtype=torch.int64,
-            device=w13.device,
-        )
         layer.exl3_trellis_tile_config = tile_config
 
     def get_fused_moe_quant_config(
@@ -1486,28 +1468,20 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         x: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> dict[str, Any]:
-        # Rank-sliced target and draft layers both reach small row counts
-        # (typically m=1..3) during profiling, decode, or CUDA-graph capture. If
-        # m falls outside the Trellis window the eager parity path is reached;
-        # under capture that is illegal and the engine cannot start:
-        #
-        #   RuntimeError: EXL3 eager parity path entered during CUDA graph
-        #   capture (m=3); capture sizes must lie inside the Trellis window
-        #   [4, 32]
-        #
-        # The backend therefore owns one capability-based default for both
-        # roles. An explicit env value remains authoritative for diagnostics.
+        # Rank-sliced target and draft layers both reach small row counts during
+        # profiling, decode, and CUDA graph capture. Sparkinfer PR49 supports
+        # m=1, so every rank-sliced request remains on the planned Trellis path.
+        # Do not retain an ExLlamaV3 parity path for an incompatible range.
         min_trellis_m = _positive_env_int(
             "VLLM_EXL3_TRELLIS_MIN_M", _DEFAULT_TRELLIS_MIN_M
         )
         max_trellis_m = _positive_env_int("VLLM_EXL3_TRELLIS_MAX_M", 32)
         block_m = _positive_env_int("VLLM_EXL3_TRELLIS_BLOCK_M", 8)
-        chunk = _positive_env_int("VLLM_EXL3_PREFILL_CHUNK", 128)
-        prefill_trellis = os.environ.get("VLLM_EXL3_PREFILL_TRELLIS", "1") == "1"
         prefill_block_m = _positive_env_int("VLLM_EXL3_PREFILL_BLOCK_M", 64)
-        if min_trellis_m > max_trellis_m:
+        if min_trellis_m != MIN_CAPTURABLE_TRELLIS_M:
             raise ValueError(
-                "VLLM_EXL3_TRELLIS_MIN_M cannot exceed VLLM_EXL3_TRELLIS_MAX_M"
+                "rank-sliced EXL3 uses Sparkinfer Trellis for every row count; "
+                f"VLLM_EXL3_TRELLIS_MIN_M must be {MIN_CAPTURABLE_TRELLIS_M}"
             )
         # Batch-INVARIANT capacity. Including x.shape[0] here made the runtime
         # cache key depend on the live batch, so any m above the planned capacity
@@ -1515,19 +1489,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         # and making the capacity guard in _apply_rank_sliced unreachable. The
         # planned capacity is a property of the layer, not of one forward pass.
         max_batched_tokens = int(layer.exl3_max_num_batched_tokens)
-        prefill_plan_enabled = prefill_trellis and max_batched_tokens > max_trellis_m
-        parity_rows = (
-            min(chunk, max_batched_tokens)
-            if prefill_plan_enabled
-            else max_batched_tokens
-        )
-        max_parity_batch = min(max_batched_tokens, min_trellis_m - 1)
-        if max_parity_batch > parity_rows:
-            raise ValueError(
-                "VLLM_EXL3_PREFILL_CHUNK cannot cover the EXL3 parity window: "
-                f"chunk={chunk}, required_rows={max_parity_batch}. Increase "
-                "VLLM_EXL3_PREFILL_CHUNK or lower VLLM_EXL3_TRELLIS_MIN_M."
-            )
+        prefill_plan_enabled = max_batched_tokens > max_trellis_m
         topk = int(topk_ids.shape[1])
         device_index = x.device.index
         key = (
@@ -1545,8 +1507,6 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             min_trellis_m,
             max_trellis_m,
             block_m,
-            chunk,
-            prefill_trellis,
             prefill_block_m,
             layer.exl3_trellis_tile_config,
         )
@@ -1599,99 +1559,15 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 max_batched_tokens, prefill_block_m
             )
 
-        ext = _load_exl3_ext()
-        required_ext = {
-            "exl3_moe",
-            "exl3_moe_max_concurrency",
-        }
-        missing_ext = sorted(name for name in required_ext if not hasattr(ext, name))
-        if missing_ext:
-            raise RuntimeError(
-                "The EXL3 extension lacks routed-expert entry points: "
-                + ", ".join(missing_ext)
-            )
-        concurrency = int(
-            ext.exl3_moe_max_concurrency(torch.accelerator.current_device_index())
-        )
-        hidden_size = int(layer.exl3_hidden_size)
-        intermediate_size = int(layer.exl3_intermediate_size_per_partition)
-        num_experts = int(layer.local_num_experts)
-        device = x.device
-        # With the prefill plan live, the parity path only ever serves
-        # m < min_trellis_m, so its persistent staging shrinks to one chunk.
         runtime = {
             "api": api,
             "trellis_plan": trellis_plan,
             "trellis_scratch": trellis_scratch,
             "prefill_plan": prefill_plan,
             "prefill_scratch": prefill_scratch,
-            "ext": ext,
             "min_trellis_m": min_trellis_m,
             "max_trellis_m": max_trellis_m,
             "max_batched_tokens": max_batched_tokens,
-            "parity_rows": parity_rows,
-            "topk": topk,
-            "chunk": chunk,
-            "xh": torch.empty(
-                (parity_rows, hidden_size),
-                dtype=torch.float16,
-                device=device,
-            ),
-            "out32": torch.empty(
-                (parity_rows, hidden_size),
-                dtype=torch.float32,
-                device=device,
-            ),
-            "tg": torch.empty(
-                (concurrency, chunk, hidden_size),
-                dtype=torch.float16,
-                device=device,
-            ),
-            "tu": torch.empty(
-                (concurrency, chunk, hidden_size),
-                dtype=torch.float16,
-                device=device,
-            ),
-            "ig": torch.empty(
-                (concurrency, chunk, intermediate_size),
-                dtype=torch.float16,
-                device=device,
-            ),
-            "iu": torch.empty(
-                (concurrency, chunk, intermediate_size),
-                dtype=torch.float16,
-                device=device,
-            ),
-            "expert_count": torch.empty(
-                num_experts + 1,
-                dtype=torch.int64,
-                device=device,
-            ),
-            "expert_offsets": torch.empty(
-                num_experts + 1,
-                dtype=torch.int64,
-                device=device,
-            ),
-            "token_sorted": torch.empty(
-                parity_rows * topk,
-                dtype=torch.int64,
-                device=device,
-            ),
-            "weight_sorted": torch.empty(
-                parity_rows * topk,
-                dtype=torch.float16,
-                device=device,
-            ),
-            "flat_token": torch.arange(
-                chunk,
-                dtype=torch.int64,
-                device=device,
-            ).repeat_interleave(topk),
-            "ones": torch.ones(
-                chunk * topk,
-                dtype=torch.int64,
-                device=device,
-            ),
         }
         _RANK_SLICED_RUNTIMES[key] = runtime
         prefill_arena_mib = (
@@ -1701,17 +1577,16 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         )
         logger.info_once(
             "EXL3 rank-sliced runtime planned: Trellis m=%d..%d block_m=%d, "
-            "prefill %s capacity=%d chunk=%d topk=%d",
+            "prefill %s capacity=%d topk=%d",
             min_trellis_m,
             max_trellis_m,
             block_m,
             (
                 f"trellis block_m={prefill_block_m} arena={prefill_arena_mib:.1f}MiB"
                 if prefill_plan is not None
-                else "parity"
+                else "not needed"
             ),
             max_batched_tokens,
-            chunk,
             topk,
         )
         return runtime
@@ -1754,102 +1629,10 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             output = runtime["api"].run(binding=binding)
             return output.to(x.dtype)
 
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "EXL3 eager parity path entered during CUDA graph capture "
-                f"(m={m}); capture sizes must lie inside the Trellis window "
-                f"[{runtime['min_trellis_m']}, {runtime['max_trellis_m']}]. "
-                f"Layer {getattr(layer, 'layer_name', '<unknown>')!r} was "
-                f"classified as {'draft' if _is_draft_layer(layer) else 'target'}. "
-                "A rank-sliced draft layer should have had its window widened to "
-                f"MIN_CAPTURABLE_TRELLIS_M={MIN_CAPTURABLE_TRELLIS_M} "
-                "automatically; if VLLM_EXL3_TRELLIS_MIN_M is set explicitly, "
-                f"lower it to {MIN_CAPTURABLE_TRELLIS_M} or unset it."
-            )
-        if m > runtime["parity_rows"]:
-            raise ValueError(
-                "EXL3 batch exceeds its planned parity capacity: "
-                f"m={m}, capacity={runtime['parity_rows']}"
-            )
-        ext = runtime["ext"]
-        xh = runtime["xh"][:m]
-        xh.copy_(x)
-        out32 = runtime["out32"][:m]
-        out32.zero_()
-        chunk = int(runtime["chunk"])
-        pointer_args = layer.exl3_pointer_tables
-        if m > chunk and hasattr(ext, "exl3_moe_fused"):
-            ext.exl3_moe_fused(
-                xh,
-                out32,
-                topk_ids,
-                topk_weights,
-                layer.exl3_expert_map,
-                runtime["expert_count"],
-                runtime["expert_offsets"],
-                runtime["token_sorted"],
-                runtime["weight_sorted"],
-                runtime["tg"],
-                runtime["tu"],
-                runtime["ig"],
-                runtime["iu"],
-                0,
-                3,
-                3,
-                3,
-                *pointer_args,
-                True,
-                False,
-                True,
-                False,
-                True,
-                False,
-                0.0,
-                0,
-            )
-            return out32.to(x.dtype)
-
-        local_ids = layer.exl3_expert_map[topk_ids.long()]
-        half_weights = topk_weights.to(torch.float16)
-        topk = int(runtime["topk"])
-        for start in range(0, m, chunk):
-            current_m = min(chunk, m - start)
-            flat = local_ids[start : start + current_m].reshape(-1)
-            order = torch.argsort(flat)
-            route_count = current_m * topk
-            token_ids = runtime["flat_token"][:route_count].index_select(0, order)
-            route_weights = (
-                half_weights[start : start + current_m]
-                .reshape(-1)
-                .index_select(0, order)
-            )
-            counts = runtime["expert_count"]
-            counts.zero_()
-            counts.scatter_add_(0, flat, runtime["ones"][:route_count])
-            ext.exl3_moe(
-                xh[start : start + current_m],
-                out32[start : start + current_m],
-                counts,
-                token_ids,
-                route_weights,
-                runtime["tg"],
-                runtime["tu"],
-                runtime["ig"],
-                runtime["iu"],
-                0,
-                3,
-                3,
-                3,
-                *pointer_args,
-                True,
-                False,
-                True,
-                False,
-                True,
-                False,
-                0.0,
-            )
-        return out32.to(x.dtype)
+        raise ValueError(
+            "rank-sliced EXL3 batch is outside the planned Sparkinfer Trellis "
+            f"capacity: m={m}, capacity={runtime['max_batched_tokens']}"
+        )
 
     def apply(
         self,
