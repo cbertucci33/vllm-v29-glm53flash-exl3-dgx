@@ -143,15 +143,22 @@ def test_reshape_padded_kv_cache_strides_by_padded_page():
 
 
 @pytest.mark.parametrize(
-    ("kernel_block_sizes", "expected_num_blocks", "expected_num_states"),
+    (
+        "kernel_block_sizes",
+        "storage_block_size",
+        "expected_num_blocks",
+        "expected_num_states",
+    ),
     [
-        (None, 4, 64),
-        ([256], 4, 64),
-        ([64], 16, 16),
+        (None, None, 4, 64),
+        ([256], None, 4, 64),
+        ([64], None, 16, 16),
+        ([64], 256, 4, 64),
     ],
 )
 def test_allocate_compressed_mla_cache(
     kernel_block_sizes: list[int] | None,
+    storage_block_size: int | None,
     expected_num_blocks: int,
     expected_num_states: int,
 ):
@@ -161,6 +168,7 @@ def test_allocate_compressed_mla_cache(
         head_size=128,
         dtype=torch.bfloat16,
         tokens_per_state=4,
+        storage_block_size=storage_block_size,
     )
     num_pages = 4
     config = KVCacheConfig(
@@ -181,6 +189,36 @@ def test_allocate_compressed_mla_cache(
     )
 
     assert caches["layer.0"].shape == (expected_num_blocks, 1, expected_num_states, 128)
+
+
+def test_allocate_kv_cache_honors_tensor_physical_block_count():
+    spec = FullAttentionSpec(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=2,
+        dtype=torch.float32,
+    )
+    physical_blocks = 3
+    offset = 5 * spec.page_size_bytes
+    config = KVCacheConfig(
+        num_blocks=10,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=offset + physical_blocks * spec.page_size_bytes,
+                layers=["draft.layer.0"],
+                layer_stride=physical_blocks * spec.page_size_bytes,
+                block_stride=spec.page_size_bytes,
+                offset=offset,
+                num_blocks=physical_blocks,
+            )
+        ],
+        kv_cache_groups=[KVCacheGroupSpec(["draft.layer.0"], spec)],
+    )
+
+    caches = allocate_kv_cache(config, torch.device("cpu"), KVCacheLayout.LBHNC)
+
+    assert caches["draft.layer.0"].shape[0] == physical_blocks
+    assert caches["draft.layer.0"].storage_offset() * 4 == offset
 
 
 @pytest.mark.parametrize("layout", list(KVCacheLayout))

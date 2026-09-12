@@ -7,6 +7,9 @@ from vllm.v1.outputs import DraftTokenIds
 from vllm.v1.worker.gpu.async_utils import async_copy_to_np
 from vllm.v1.worker.gpu.input_batch import InputBatch
 
+# Salt draft-token Gumbel draws away from the verifier's Philox range.
+DRAFT_GUMBEL_POS_OFFSET = 1 << 30
+
 
 class DraftTokensHandler:
     def __init__(self, device: torch.device | None = None):

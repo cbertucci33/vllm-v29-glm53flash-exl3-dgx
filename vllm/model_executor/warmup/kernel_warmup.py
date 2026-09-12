@@ -38,6 +38,9 @@ from vllm.model_executor.warmup.qwen_triton_warmup import qwen_triton_warmup
 from vllm.model_executor.warmup.sparse_mla_triton_warmup import (
     sparse_mla_triton_warmup,
 )
+from vllm.model_executor.warmup.spec_decode_rejection_warmup import (
+    spec_decode_rejection_warmup,
+)
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import is_deep_gemm_supported
 from vllm.utils.flashinfer import has_flashinfer
@@ -108,6 +111,23 @@ def _warmup_kimi_k3_gemm_rs_ar() -> None:
         logger.info_once("Warmed up %d Kimi-K3 GEMM-RS/AR variants.", compiled)
 
 
+def _warmup_flashinfer_sm120_sparse_mla_workspace(worker: "Worker") -> None:
+    """Allocate the persistent SM120 sparse-MLA workspace before graph capture."""
+    uses_sm120_sparse_mla = any(
+        group.backend.get_name() == "FLASHINFER_MLA_SPARSE_SM120"
+        for groups in worker.model_runner.attn_groups
+        for group in groups
+    )
+    if not uses_sm120_sparse_mla:
+        return
+
+    from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
+        _get_workspace_buffer,
+    )
+
+    _get_workspace_buffer(worker.model_runner.device)
+
+
 def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     from vllm.model_executor.warmup.minimax_m3_msa_warmup import (
         minimax_m3_msa_warmup,
@@ -155,11 +175,13 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
         kimi_k3_triton_warmup(worker)
         fa4_cutedsl_warmup(worker)
         sparse_mla_triton_warmup(worker)
+        spec_decode_rejection_warmup(worker)
 
     if current_platform.has_device_capability(90):
         _warmup_ll_bf16_router_gemm(worker.get_model())
 
     _warmup_kimi_k3_gemm_rs_ar()
+    _warmup_flashinfer_sm120_sparse_mla_workspace(worker)
 
     if worker.vllm_config.kernel_config.enable_cutedsl_warmup:
         # TODO(roberto): Remove after registered CuTeDSL warmups are migrated

@@ -15,6 +15,7 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.core.single_type_kv_cache_manager import (
     ChunkedLocalAttentionManager,
     CircularBufferManager,
+    DFlashRingManager,
     FullAttentionManager,
     MambaManager,
     RSWAManager,
@@ -23,6 +24,7 @@ from vllm.v1.core.single_type_kv_cache_manager import (
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     CircularBufferSpec,
+    DFlashSWASpec,
     FullAttentionSpec,
     MambaSpec,
     RSWASpec,
@@ -30,6 +32,60 @@ from vllm.v1.kv_cache_interface import (
 )
 
 pytestmark = pytest.mark.cpu_test
+
+
+def test_non_prefix_cacheable_sliding_window_skips_cache_registration():
+    spec = DFlashSWASpec(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        sliding_window=4,
+    )
+    block_pool = BlockPool(num_gpu_blocks=4, enable_caching=True, hash_block_size=1)
+    manager = SlidingWindowManager(
+        spec,
+        block_pool=block_pool,
+        enable_caching=True,
+        kv_cache_group_id=0,
+        scheduler_block_size=4,
+    )
+
+    # A non-prefix-cacheable scratch group has no Request/hash dependency.
+    manager.cache_blocks(None, num_tokens=4, replay_boundary=0)  # type: ignore[arg-type]
+
+    assert manager.num_cached_block == {}
+
+
+def test_dflash_private_ring_does_not_debit_block_pool():
+    spec = DFlashSWASpec(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        sliding_window=8,
+        private_ring=True,
+    )
+    block_pool = BlockPool(num_gpu_blocks=4, enable_caching=True, hash_block_size=1)
+    manager = DFlashRingManager(
+        spec,
+        block_pool=block_pool,
+        enable_caching=True,
+        kv_cache_group_id=0,
+        scheduler_block_size=4,
+    )
+    free_before = block_pool.get_num_free_blocks()
+
+    assert (
+        manager.get_num_blocks_to_allocate(
+            "request", 4096, (), 0, 0, 4096, apply_admission_cap=True
+        )
+        == 0
+    )
+    assert manager.allocate_new_blocks("request", 4096, 4096) == []
+    manager.free("request")
+
+    assert block_pool.get_num_free_blocks() == free_before
 
 
 def test_external_computed_blocks_do_not_corrupt_free_pool():
@@ -192,7 +248,7 @@ def test_circular_buffer_allocates_one_block_for_the_request_lifetime():
         )
         assert manager.allocate_new_blocks(request_id, num_tokens, num_tokens) == []
 
-    manager.cache_blocks(request_id, 1024)
+    manager.cache_blocks(request_id, 1024, replay_boundary=0)
     manager.remove_skipped_blocks(request_id, 1024)
     assert manager.get_num_common_prefix_blocks(request_id) == 0
     assert manager.get_num_skipped_tokens(1024) == 0

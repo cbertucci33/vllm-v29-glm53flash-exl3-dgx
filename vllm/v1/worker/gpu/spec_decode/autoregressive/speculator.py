@@ -46,6 +46,9 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         self.prefill_cudagraph_manager: SpeculatorCudaGraphManager | None = None
         self.decode_cudagraph_manager: SpeculatorCudaGraphManager | None = None
         self.use_fused_multi_step_decode = False
+        # True when the draft model compacts prefill outputs to one row per
+        # request (set_prefill_output_indices); indexing then differs below.
+        self.prefill_outputs_are_compact = False
 
     def load_model(self, target_model: nn.Module) -> None:
         super().load_model(target_model)
@@ -457,8 +460,12 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             cudagraph_runtime_mode=cudagraph_runtime_mode,
             mm_inputs=mm_inputs,
         )
-
-        sample_hidden_states = last_hidden_states[last_token_indices]
+        if self.prefill_outputs_are_compact:
+            sample_hidden_states = last_hidden_states[:num_reqs]
+            feedback_hidden_states = hidden_states[:num_reqs]
+        else:
+            sample_hidden_states = last_hidden_states[last_token_indices]
+            feedback_hidden_states = hidden_states[last_token_indices]
         self.draft_tokens[:num_reqs, 0] = self.sample_draft(
             sample_hidden_states,
             sample_src_positions,
@@ -471,7 +478,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         if last_hidden_states is hidden_states:
             self.hidden_states[:num_reqs] = sample_hidden_states
         else:
-            self.hidden_states[:num_reqs] = hidden_states[last_token_indices]
+            self.hidden_states[:num_reqs] = feedback_hidden_states
         self.input_buffers.positions[:num_reqs] = positions
         self.sample_src_positions[:num_reqs] = sample_src_positions
 

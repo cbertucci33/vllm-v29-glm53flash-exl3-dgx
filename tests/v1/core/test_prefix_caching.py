@@ -1166,6 +1166,7 @@ def test_hybrid_cache_mamba_align_shared_prefix_detection():
         use_eagle=False,
         hash_block_size=block_size,
         mamba_partial_cache_hit=False,
+        mamba_fine_grained_prefix_cache=False,
         mamba_has_prefill_checkpoint_blocks=False,
     )
     req_2.shared_prefix_boundary = shared_prefix_boundary
@@ -2133,6 +2134,45 @@ def test_maybe_evict_cached_block():
     # Evict block3
     pool._maybe_evict_cached_block(block3)
     assert pool.cached_block_hash_to_block._cache == {}
+
+
+def test_refresh_cached_free_blocks():
+    pool = BlockPool(num_gpu_blocks=6, enable_caching=True, hash_block_size=16)
+    # pool.blocks[0] became the null block; the queue holds b1..b5 in order.
+    b1, b2, b3, b4, b5 = pool.blocks[1:6]
+    hashes = {}
+    for i, blk in ((1, b1), (2, b2), (4, b4)):
+        block_hash = make_block_hash_with_group_id(BlockHash(str(i).encode()), 0)
+        hashes[i] = block_hash
+        blk.set_block_hash(block_hash, i * 16)
+        pool.cached_block_hash_to_block.insert(block_hash, blk)
+
+    # Entries move to the LRU-young end in the given order (first entry is
+    # the first of the refreshed to be evicted).
+    pool.refresh_cached_free_blocks([(b2, hashes[2]), (b1, hashes[1])])
+    assert pool.free_block_queue.get_all_free_blocks() == [b3, b4, b5, b2, b1]
+
+    # A re-referenced block (removed from the queue by touch) is skipped.
+    pool.touch([b4])
+    pool.refresh_cached_free_blocks([(b4, hashes[4])])
+    assert pool.free_block_queue.get_all_free_blocks() == [b3, b5, b2, b1]
+
+    # A recycled block (hash cleared or replaced) is skipped.
+    stale = make_block_hash_with_group_id(BlockHash(b"stale"), 0)
+    pool.refresh_cached_free_blocks([(b3, stale)])
+    assert pool.free_block_queue.get_all_free_blocks() == [b3, b5, b2, b1]
+
+    # The null block and never-cached blocks are skipped.
+    pool.refresh_cached_free_blocks(
+        [(pool.null_block, hashes[1]), (b5, hashes[1])]
+    )
+    assert pool.free_block_queue.get_all_free_blocks() == [b3, b5, b2, b1]
+
+    # No-op when caching is disabled.
+    pool2 = BlockPool(num_gpu_blocks=4, enable_caching=False, hash_block_size=16)
+    first = pool2.free_block_queue.get_all_free_blocks()[0]
+    pool2.refresh_cached_free_blocks([(first, hashes[1])])
+    assert pool2.free_block_queue.get_all_free_blocks()[0] is first
 
 
 @pytest.mark.parametrize("blocks_to_cache", [2, 3, 10])
@@ -3537,9 +3577,10 @@ def test_hybrid_local_kv_retention_mtp_reuses_latest_boundary():
         use_eagle=True,
     )
 
-    # 127 tokens: latest replay boundary is floor((127 - 1) / 32) * 32 = 96.
-    # The EAGLE/MTP SWA lookup group must cache the local tail ending at
-    # 104 tokens, and that tail is two 8-token blocks wide: hashes 11 and 12.
+    # 127 tokens: eagle proves a boundary only if an aligned unit exists past
+    # it, so the replay boundary rewinds one unit to
+    # floor(127 / 32) * 32 - 32 = 64. The SWA tail plus its proof block then
+    # ends at 72, two 8-token blocks wide: hashes 7 and 8.
     token_ids = [i for i in range(15) for _ in range(block_size)] + [15] * 7
     req0 = make_request("0", token_ids, block_size, sha256)
     computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req0)
@@ -3553,7 +3594,7 @@ def test_hybrid_local_kv_retention_mtp_reuses_latest_boundary():
     assert blocks is not None
 
     pool = manager.block_pool
-    expected_swa_cached = {11, 12}
+    expected_swa_cached = {7, 8}
     for i in range(15):
         cached = pool.get_cached_block(req0.block_hashes[i], kv_cache_group_ids=[1])
         if i in expected_swa_cached:
@@ -3565,8 +3606,8 @@ def test_hybrid_local_kv_retention_mtp_reuses_latest_boundary():
 
     req1 = make_request("1", token_ids, block_size, sha256)
     computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req1)
-    assert num_computed_tokens == 12 * block_size
-    assert [len(blocks) for blocks in computed_blocks.blocks] == [3, 12]
+    assert num_computed_tokens == 8 * block_size
+    assert [len(blocks) for blocks in computed_blocks.blocks] == [2, 8]
 
 
 def test_block_lookup_cache_single_block_per_key():

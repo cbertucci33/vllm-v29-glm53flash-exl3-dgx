@@ -80,6 +80,9 @@ DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES = frozenset(
         "DeepSeekV4MTPModel",
         "Dots3NoteForCausalLM",
         "Dots3NoteMTPModel",
+        "Glm5NextForCausalLM",
+        "Glm5NextForConditionalGeneration",
+        "Glm5NextMTPModel",
         "GlmMoeDsaForCausalLM",
         "HYV4ForCausalLM",
         "HYV4MTPModel",
@@ -1654,6 +1657,13 @@ class VllmConfig:
             self._validate_v2_model_runner()
         else:
             self._validate_v1_model_runner()
+            if self._is_dflash2_draft():
+                # An explicit V1 override would boot the legacy proposer,
+                # which never calls the DFlash2 candidate selector.
+                raise ValueError(
+                    "DFlash2 drafts require Model Runner V2. "
+                    "Remove VLLM_USE_V2_MODEL_RUNNER=0."
+                )
 
         self._validate_batch_sharded_sampling()
         self._validate_adaptive_verification()

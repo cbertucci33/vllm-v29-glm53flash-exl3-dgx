@@ -6,6 +6,7 @@ from collections import defaultdict
 from collections.abc import Sequence
 from typing import ClassVar
 
+from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
@@ -20,8 +21,10 @@ from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     CircularBufferSpec,
     CrossAttentionSpec,
+    DFlashSWASpec,
     FullAttentionSpec,
     HiddenStateCacheSpec,
+    KpoolTailSpec,
     KVCacheSpec,
     MambaSpec,
     MLAAttentionSpec,
@@ -32,6 +35,8 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
+
+logger = init_logger(__name__)
 
 
 class SingleTypeKVCacheManager(ABC):
@@ -113,7 +118,9 @@ class SingleTypeKVCacheManager(ABC):
         # aligned segment (SWA). Initialized lazily by the coordinator after
         # determining the attention groups.
         self.use_eagle = False
-
+        # ``CacheConfig.enable_mamba_fine_grained_prefix_cache``, narrowed and set
+        # by ``KVCacheManager``; only an EAGLE Mamba "align" group ever gets it.
+        self.fine_grained_prefix_cache = False
         # Partial-hit copy-on-write bookkeeping. Populated only by fine-grained
         # managers (full attention, mamba "align"); harmlessly empty elsewhere.
         self._partial_hit_reqs: dict[str, tuple[int, KVCacheBlock]] = {}
@@ -434,6 +441,8 @@ class SingleTypeKVCacheManager(ABC):
         request: Request,
         num_tokens: int,
         retention_interval: int | None = None,
+        *,
+        replay_boundary: int,
     ) -> None:
         """
         Cache the blocks for the request.
@@ -447,6 +456,12 @@ class SingleTypeKVCacheManager(ABC):
                 boundary; a positive multiple of ``scheduler_block_size`` keeps
                 a tail once per that-sized segment. Only SWA acts on it.
         """
+        # Scratch/ring specs such as DFlashSWASpec deliberately opt out of
+        # prefix caching. They still use a normal manager for request-local
+        # allocation, but must never enter hashing or reachable-tail logic.
+        if not self.kv_cache_spec.prefix_cacheable:
+            return
+
         num_cached_blocks = self.num_cached_block.get(request.request_id, 0)
         num_full_blocks = num_tokens // self.block_size
 
@@ -456,7 +471,7 @@ class SingleTypeKVCacheManager(ABC):
         # Token boundaries whose reachable tail must be retained under sparse
         # retention: the replay boundary (``num_prompt - 1``, capped by
         # ``get_computed_blocks``) and any detected shared-prefix junction.
-        reachable_boundaries = [request.num_prompt_tokens - 1]
+        reachable_boundaries = [replay_boundary]
         if request.shared_prefix_boundary:
             reachable_boundaries.append(request.shared_prefix_boundary)
 
@@ -628,6 +643,18 @@ class SingleTypeKVCacheManager(ABC):
             blocks[i] = self._null_block
         if freed:
             self.block_pool.free_blocks(freed)
+            self._on_blocks_freed_early(request_id, freed)
+
+    def _on_blocks_freed_early(
+        self, request_id: str, blocks: list[KVCacheBlock]
+    ) -> None:
+        """Hook for blocks freed while their request is still alive.
+
+        Subclasses that re-age such blocks at request retirement (see
+        ``BlockPool.refresh_cached_free_blocks``) override this to record
+        them; the default keeps no bookkeeping.
+        """
+        return None
 
     def remove_skipped_blocks(
         self,
@@ -791,8 +818,15 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         request: Request,
         num_tokens: int,
         retention_interval: int | None = None,
+        *,
+        replay_boundary: int,
     ) -> None:
-        super().cache_blocks(request, num_tokens, retention_interval=retention_interval)
+        super().cache_blocks(
+            request,
+            num_tokens,
+            retention_interval=retention_interval,
+            replay_boundary=replay_boundary,
+        )
         hash_block_size = self.block_pool.hash_block_size
         if self.block_size == hash_block_size:
             return
@@ -1115,6 +1149,103 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         return 0
 
 
+class DFlashRingManager(SlidingWindowManager):
+    """Scheduler bookkeeping for worker-owned DFlash KV rings.
+
+    DFlash ring pages are allocated outside ``BlockPool`` and keyed by the
+    worker's persistent request slot. The scheduler therefore owns no blocks
+    for this group; the worker synthesizes the logical block table directly
+    from sequence lengths before each draft forward.
+    """
+
+    def get_num_blocks_to_allocate(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        total_computed_tokens: int,
+        num_local_computed_tokens: int,
+        num_tokens_main_model: int,
+        apply_admission_cap: bool = False,
+    ) -> int:
+        del (
+            request_id,
+            num_tokens,
+            new_computed_blocks,
+            total_computed_tokens,
+            num_local_computed_tokens,
+            num_tokens_main_model,
+            apply_admission_cap,
+        )
+        return 0
+
+    def add_local_computed_blocks(
+        self,
+        request_id: str,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        num_local_computed_tokens: int,
+        num_external_computed_tokens: int,
+    ) -> None:
+        del num_local_computed_tokens
+        assert not new_computed_blocks
+        assert num_external_computed_tokens == 0
+        self.req_to_blocks[request_id]
+        self.num_cached_block[request_id] = 0
+
+    def allocate_external_computed_blocks(
+        self,
+        request_id: str,
+        num_local_computed_tokens: int,
+        num_external_computed_tokens: int,
+    ) -> None:
+        del request_id, num_local_computed_tokens
+        assert num_external_computed_tokens == 0
+
+    def allocate_new_blocks(
+        self, request_id: str, num_tokens: int, num_tokens_main_model: int
+    ) -> list[KVCacheBlock]:
+        del num_tokens, num_tokens_main_model
+        self.req_to_blocks[request_id]
+        return []
+
+    def remove_skipped_blocks(
+        self,
+        request_id: str,
+        processed_computed_tokens: int,
+        num_prompt_tokens: int | None = None,
+    ) -> None:
+        del request_id, processed_computed_tokens, num_prompt_tokens
+
+    def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
+        del running_request_id
+        return 0
+
+    @classmethod
+    def find_longest_cache_hit(
+        cls,
+        block_hashes: BlockHashList,
+        max_length: int,
+        kv_cache_group_ids: list[int],
+        block_pool: BlockPool,
+        kv_cache_spec: KVCacheSpec,
+        drop_eagle_block: bool,
+        alignment_tokens: int,
+        dcp_world_size: int = 1,
+        pcp_world_size: int = 1,
+    ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
+        del (
+            block_hashes,
+            max_length,
+            block_pool,
+            kv_cache_spec,
+            drop_eagle_block,
+            alignment_tokens,
+            dcp_world_size,
+            pcp_world_size,
+        )
+        return tuple([] for _ in kv_cache_group_ids), 0
+
+
 class CircularBufferManager(FullAttentionManager):
     """Claims the ring's single block per request; prefix caching disabled."""
 
@@ -1175,6 +1306,8 @@ class CircularBufferManager(FullAttentionManager):
         request: Request,
         num_tokens: int,
         retention_interval: int | None = None,
+        *,
+        replay_boundary: int,
     ) -> None:
         return
 
@@ -1200,6 +1333,10 @@ class CircularBufferManager(FullAttentionManager):
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
         return 0
+
+
+class KpoolTailManager(CircularBufferManager):
+    """One-block circular scratch manager for ``KpoolTailSpec``."""
 
 
 class ChunkedLocalAttentionManager(SingleTypeKVCacheManager):
@@ -1388,6 +1525,12 @@ class MambaManager(SingleTypeKVCacheManager):
             # into a private cow_block; we record that block for connector
             # offload (see _pending_boundary_state_offloads).
             self._producer_partial_tail_reqs: dict[str, int] = {}
+            # Hash-cached boundary-state blocks freed while the request was
+            # still running, re-aged at retirement so they are not the pool's
+            # first eviction candidates (entries: block, hash, prefix tokens).
+            self._freed_boundary_blocks: dict[
+                str, list[tuple[KVCacheBlock, BlockHashWithGroupId, int]]
+            ] = {}
 
     @classmethod
     def find_longest_cache_hit(
@@ -1553,8 +1696,22 @@ class MambaManager(SingleTypeKVCacheManager):
             ):
                 blocks = self.req_to_blocks[request_id]
                 if blocks[last_state_block_idx] != self._null_block:
-                    self.block_pool.free_blocks([blocks[last_state_block_idx]])
+                    freed_block = blocks[last_state_block_idx]
+                    self.block_pool.free_blocks([freed_block])
                     blocks[last_state_block_idx] = self._null_block
+                    self._on_blocks_freed_early(request_id, [freed_block])
+
+    def _on_blocks_freed_early(
+        self, request_id: str, blocks: list[KVCacheBlock]
+    ) -> None:
+        if self.mamba_cache_mode != "align":
+            return
+        for block in blocks:
+            block_hash = block.block_hash
+            if block_hash is not None:
+                self._freed_boundary_blocks.setdefault(request_id, []).append(
+                    (block, block_hash, block.block_hash_num_tokens or 0)
+                )
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         """
@@ -1805,6 +1962,17 @@ class MambaManager(SingleTypeKVCacheManager):
                 for entry in self._pending_boundary_state_offloads
                 if entry[0] != request_id
             ]
+            tracked = self._freed_boundary_blocks.pop(request_id, None)
+            if tracked:
+                # Re-age the request's early-freed boundary states, latest
+                # boundary first: under pressure the joint hit then shrinks
+                # from the tail, matching the attention side's reversed
+                # retirement free, instead of zeroing outright when an old
+                # interior state is recycled ahead of the resident prefix.
+                tracked.sort(key=lambda entry: entry[2], reverse=True)
+                self.block_pool.refresh_cached_free_blocks(
+                    (block, block_hash) for block, block_hash, _ in tracked
+                )
         return super().pop_blocks_for_free(request_id)
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
@@ -1820,9 +1988,16 @@ class MambaManager(SingleTypeKVCacheManager):
         request: Request,
         num_tokens: int,
         retention_interval: int | None = None,
+        *,
+        replay_boundary: int,
     ) -> None:
         num_cached_blocks_before = self.num_cached_block.get(request.request_id, 0)
-        super().cache_blocks(request, num_tokens, retention_interval=retention_interval)
+        super().cache_blocks(
+            request,
+            num_tokens,
+            retention_interval=retention_interval,
+            replay_boundary=replay_boundary,
+        )
         num_cached_blocks_after = self.num_cached_block.get(request.request_id, 0)
         if self.mamba_cache_mode == "align":
             partial_hash = self._cache_partial_tail_block(request, num_tokens)
@@ -1870,7 +2045,22 @@ class MambaManager(SingleTypeKVCacheManager):
         latest_prompt_hash_boundary = (
             request.num_prompt_tokens // hash_block_size
         ) * hash_block_size
-        if num_tokens != latest_prompt_hash_boundary:
+        if self.use_eagle:
+            # Eagle groups match one hash unit past the candidate and drop it,
+            # so register the tail one unit lower.
+            latest_prompt_hash_boundary = max(
+                latest_prompt_hash_boundary - hash_block_size, 0
+            )
+        # The junction is the other position a sibling resumes at: where one was
+        # observed to stop, and where the scheduler already ends a chunk. Bounded
+        # to the prompt chunk being computed -- during decode the target is the
+        # running state block, mutated in place, which equals what its key
+        # promises only after that step's forward.
+        if num_tokens != latest_prompt_hash_boundary and not (
+            self.fine_grained_prefix_cache
+            and num_tokens == request.shared_prefix_boundary
+            and request.num_computed_tokens < num_tokens <= request.num_prompt_tokens
+        ):
             return None
 
         block_idx = num_tokens // self.block_size
@@ -1927,6 +2117,8 @@ class CrossAttentionManager(SingleTypeKVCacheManager):
         request: Request,
         num_tokens: int,
         retention_interval: int | None = None,
+        *,
+        replay_boundary: int,
     ) -> None:
         # We do not cache blocks for cross-attention to be shared between
         # requests, so this method is not relevant.
@@ -2009,7 +2201,11 @@ def get_manager_for_kv_cache_spec(
     Returns:
         An instance of the appropriate SingleTypeKVCacheManager subclass
     """
-    manager_class = KVCacheSpecRegistry.get_manager_class(kv_cache_spec)
+    manager_class = (
+        DFlashRingManager
+        if type(kv_cache_spec) is DFlashSWASpec and kv_cache_spec.private_ring
+        else KVCacheSpecRegistry.get_manager_class(kv_cache_spec)
+    )
     assert manager_class is not None, (
         f"No manager registered for KVCacheSpec {type(kv_cache_spec)}"
     )
@@ -2047,6 +2243,11 @@ def register_all_kvcache_specs(vllm_config):
         uniform_type_base_spec=SlidingWindowSpec,
     )
     KVCacheSpecRegistry.register(
+        DFlashSWASpec,
+        SlidingWindowManager,
+        uniform_type_base_spec=DFlashSWASpec,
+    )
+    KVCacheSpecRegistry.register(
         CircularBufferSpec,
         CircularBufferManager,
         uniform_type_base_spec=CircularBufferSpec,
@@ -2055,6 +2256,11 @@ def register_all_kvcache_specs(vllm_config):
         SlidingWindowMLASpec,
         SlidingWindowManager,
         uniform_type_base_spec=SlidingWindowMLASpec,
+    )
+    KVCacheSpecRegistry.register(
+        KpoolTailSpec,
+        KpoolTailManager,
+        uniform_type_base_spec=KpoolTailSpec,
     )
 
     KVCacheSpecRegistry.register(

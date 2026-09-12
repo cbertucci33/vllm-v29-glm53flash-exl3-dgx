@@ -15,9 +15,11 @@ from vllm.v1.core.kv_cache_coordinator import (
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
+from vllm.v1.core.single_type_kv_cache_manager import MambaManager
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CrossAttentionSpec,
+    DFlashSWASpec,
     EncoderOnlyAttentionSpec,
     KVCacheConfig,
     MambaSpec,
@@ -132,6 +134,7 @@ class KVCacheManager:
         pcp_world_size: int = 1,
         metrics_collector: KVCacheMetricsCollector | None = None,
         watermark: float = 0.0,
+        enable_mamba_fine_grained_prefix_cache: bool = False,
     ) -> None:
         self.max_model_len = max_model_len
         # When unset, fall back to `max_model_len` so the recycling-aware cap
@@ -164,9 +167,35 @@ class KVCacheManager:
             metrics_collector=self.metrics_collector,
             num_prefill_lookahead=num_prefill_lookahead,
         )
+        # One predicate, read by both sides of the feature, so the scheduler
+        # cannot end a chunk at a junction the manager would refuse -- a refused
+        # junction costs a forward pass and displaces the block-boundary stop.
+        # Multi-module MTP is excluded because ``cache_blocks`` then hands the
+        # manager ``num_computed - num_reprefillable`` rather than the chunk end.
+        self.mamba_fine_grained_prefix_cache = (
+            enable_mamba_fine_grained_prefix_cache
+            and bool(self.coordinator.eagle_group_ids)
+            and self.coordinator.enable_partial_hash_hits
+            and self.coordinator.num_reprefillable_tokens == 0
+        )
+        if self.mamba_fine_grained_prefix_cache:
+            for manager in self.coordinator.single_type_managers:
+                if isinstance(manager, MambaManager):
+                    manager.fine_grained_prefix_cache = True
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
         self.kv_cache_config = kv_cache_config
+
+        self.draft_replay_reserve = 0
+        if self.coordinator.enable_partial_hash_hits:
+            self.draft_replay_reserve = max(
+                (
+                    group.kv_cache_spec.sliding_window
+                    for group in kv_cache_config.kv_cache_groups
+                    if type(group.kv_cache_spec) is DFlashSWASpec
+                ),
+                default=0,
+            )
 
         # Watermark: minimum number of KV cache blocks to keep free when
         # admitting waiting/preempted requests, to avoid frequent preemptions.
@@ -255,7 +284,9 @@ class KVCacheManager:
         # the single last token, because allocate_slots() requires
         # num_computed_tokens to be block-size aligned. Removing this limitation
         # could slightly improve performance in the future.
-        max_cache_hit_length = request.num_tokens - 1
+        max_cache_hit_length = max(
+            request.num_tokens - 1 - self.draft_replay_reserve, 0
+        )
         computed_blocks, num_new_computed_tokens, num_uncached = (
             self.coordinator.find_longest_cache_hit(
                 request.block_hashes, max_cache_hit_length

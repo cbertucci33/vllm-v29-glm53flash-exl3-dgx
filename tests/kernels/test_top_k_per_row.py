@@ -1266,6 +1266,43 @@ def test_persistent_topk_reused_group_after_short_row() -> None:
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@pytest.mark.parametrize(
+    ("top_k", "seq_len", "num_rows"),
+    [
+        pytest.param(512, 800_000, 1, id="glm53-production-shape"),
+        pytest.param(2048, 400_000, 2, id="deepseek-long-context-shape"),
+        pytest.param(1024, 32_769, 2, id="radix-threshold-boundary"),
+    ],
+)
+@torch.inference_mode()
+def test_persistent_topk_low_smem_long_rows_are_exact(
+    top_k: int, seq_len: int, num_rows: int
+) -> None:
+    """The low-smem, non-cooperative path must preserve exact top-k values."""
+    props = torch.cuda.get_device_properties(0)
+    if props.shared_memory_per_block_optin >= 128 * 1024:
+        pytest.skip("The non-cooperative path requires less than 128 KiB opt-in smem")
+
+    set_random_seed(7)
+    logits = torch.randn(num_rows, seq_len, dtype=torch.float32, device="cuda")
+    if num_rows > 1:
+        # Exercise a dense tie at the cutoff. Index choice may differ, but the
+        # selected value multiset must match torch.topk exactly.
+        logits[1, : top_k + 64] = 1.0
+    lengths = torch.full((num_rows,), seq_len, dtype=torch.int32, device="cuda")
+    indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
+
+    _run_topk_backend(
+        "persistent_topk", logits, lengths, indices, top_k, seq_len
+    )
+    torch.accelerator.synchronize()
+
+    actual = logits.gather(1, indices.to(torch.int64)).sort(dim=1).values
+    expected = logits.topk(top_k, dim=1).values.sort(dim=1).values
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
 @pytest.mark.parametrize("top_k", [512, 2048])
 @pytest.mark.parametrize("backend", WORKSPACE_TOPK_BACKENDS)
 @torch.inference_mode()

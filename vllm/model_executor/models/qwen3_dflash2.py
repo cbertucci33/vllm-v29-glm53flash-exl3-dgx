@@ -5,9 +5,17 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+import vllm.envs as envs
 from vllm.compilation.backends import set_model_tag
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
+from vllm.logger import init_logger
+from vllm.model_executor.layers.fp8_draft_head import (
+    Fp8DraftHead,
+    fp8_draft_head_logits,
+    fp8_draft_head_supported,
+    quantize_draft_head,
+)
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -18,6 +26,8 @@ from .qwen3_dflash import (
     DFlashQwen3Model,
 )
 from .utils import maybe_prefix
+
+logger = init_logger(__name__)
 
 
 def _grouped_conv(
@@ -52,6 +62,7 @@ class DFlashGroupedConv(nn.Module):
         block_size: int,
         params_dtype: torch.dtype,
         prefix: str,
+        quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__()
         if hidden_size % group_size:
@@ -66,12 +77,15 @@ class DFlashGroupedConv(nn.Module):
             torch.empty(2, taps, hidden_size, dtype=params_dtype),
             requires_grad=False,
         )
+        # Quantized DFlash2 checkpoints (e.g. ModelOpt MXFP8) quantize the
+        # conv kernel projections too, so they must build through the
+        # quant-aware path or their weight_scale tensors have no home.
         self.kernel_projection = ReplicatedLinear(
             hidden_size,
             2 * taps * self.num_groups,
             bias=False,
             params_dtype=params_dtype,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=maybe_prefix(prefix, "kernel_projection"),
             return_bias=False,
         )
@@ -123,13 +137,24 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
         draft_config = config.dflash_config
         speculative_config = vllm_config.speculative_config
         assert speculative_config is not None
+        # Query tokens per request: the bonus token plus the mask tokens.
+        block_size = 1 + speculative_config.num_speculative_tokens
+        trained_block_size = draft_config.get("block_size")
+        if trained_block_size is not None and int(trained_block_size) != block_size:
+            # The convolutions' block modulus is baked in at training time; a
+            # mismatch drafts silently garbage-quality tokens.
+            raise ValueError(
+                f"DFlash2 draft was trained with block_size {trained_block_size} "
+                f"(= num_speculative_tokens {int(trained_block_size) - 1}); got "
+                f"num_speculative_tokens {speculative_config.num_speculative_tokens}."
+            )
         conv_args = dict(
             hidden_size=config.hidden_size,
             taps=int(draft_config["conv_kernel_size"]),
             group_size=int(draft_config["conv_group_size"]),
-            # Query tokens per request: the bonus token plus the mask tokens.
-            block_size=1 + speculative_config.num_speculative_tokens,
+            block_size=block_size,
             params_dtype=vllm_config.model_config.dtype,
+            quant_config=quant_config,
         )
         self.attention_conv = DFlashGroupedConv(
             **conv_args, prefix=maybe_prefix(prefix, "attention_conv")
@@ -194,6 +219,7 @@ class CandidateSelector(nn.Module):
         top_k: int,
         params_dtype: torch.dtype,
         prefix: str,
+        quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__()
         self.top_k = top_k
@@ -208,7 +234,7 @@ class CandidateSelector(nn.Module):
             rank,
             bias=False,
             params_dtype=params_dtype,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=maybe_prefix(prefix, "hidden_projection"),
             return_bias=False,
         )
@@ -260,6 +286,7 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
                 top_k=int(draft_config["selector_top_k"]),
                 params_dtype=vllm_config.model_config.dtype,
                 prefix=maybe_prefix(prefix, "candidate_selector"),
+                quant_config=self.quant_config,
             )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -271,6 +298,15 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        target_vocab_size = vllm_config.model_config.get_vocab_size()
+        if int(self.config.vocab_size) != int(target_vocab_size):
+            # The selector codebooks are sized by the draft config, but the
+            # candidate ids index them straight from the shared target-vocab
+            # head: a mismatch is an out-of-bounds gather (or untrained rows).
+            raise ValueError(
+                f"DFlash2 draft vocab ({self.config.vocab_size}) must match "
+                f"the target vocab ({target_vocab_size})."
+            )
         draft_config = self.config.dflash_config
         softcap = float(draft_config.get("final_logit_softcapping") or 0.0)
         self.candidate_logits_processor = LogitsProcessor(
@@ -278,12 +314,47 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
             scale=float(draft_config.get("output_multiplier", 1.0)),
             soft_cap=softcap if softcap > 0 else None,
         )
+        self._fp8_draft_head: Fp8DraftHead | None = None
+
+    def maybe_init_fp8_draft_head(self) -> None:
+        """Materialize a rowwise-fp8 copy of the (shared) lm_head shard.
+
+        Opt-in via VLLM_DFLASH_FP8_DRAFT_HEAD. Runs eagerly after the target
+        head is aliased onto this model and before CUDA graph capture: the
+        candidate top-k reads the copy on every draft step, halving the
+        full-vocab weight traffic. Draft-time only; the verify pass scores
+        with the unquantized head, so accepted outputs are unchanged.
+        """
+        if not envs.VLLM_DFLASH_FP8_DRAFT_HEAD:
+            return
+        if not fp8_draft_head_supported(self.lm_head.weight.device):
+            logger.warning(
+                "VLLM_DFLASH_FP8_DRAFT_HEAD is set but this device has no fp8 "
+                "support (SM89+ required); using the unquantized draft head."
+            )
+            return
+        self._fp8_draft_head = quantize_draft_head(self.lm_head.weight)
+        logger.info_once(
+            "DFlash2 candidate top-k uses a rowwise-fp8 copy of the target "
+            "lm_head (draft-time only; verify pass untouched)."
+        )
 
     def compute_candidates(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # This path bypasses compute_logits, so a draft->target id remap would
+        # be silently skipped; DFlash2 checkpoints must not carry one.
+        assert getattr(self, "draft_id_to_target_id", None) is None, (
+            "DFlash2 does not support draft_id_to_target_id remapping."
+        )
+        local_logits = None
+        if self._fp8_draft_head is not None:
+            local_logits = fp8_draft_head_logits(hidden_states, self._fp8_draft_head)
         return self.candidate_logits_processor.get_top_k_tokens(
-            self.lm_head, hidden_states, self.model.candidate_selector.top_k
+            self.lm_head,
+            hidden_states,
+            self.model.candidate_selector.top_k,
+            local_logits=local_logits,
         )
 
 

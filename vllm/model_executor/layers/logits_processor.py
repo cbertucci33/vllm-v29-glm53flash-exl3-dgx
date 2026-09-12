@@ -41,7 +41,22 @@ def _flashinfer_topk() -> Callable[..., tuple[torch.Tensor, torch.Tensor]] | Non
             "at roughly half the speed."
         )
         return None
+    import inspect
+
     from flashinfer import top_k
+
+    try:
+        params = inspect.signature(top_k).parameters
+    except (TypeError, ValueError):
+        params = {}
+    if not {"sorted", "deterministic"} <= set(params):
+        # A same-named export with a different API would otherwise raise
+        # TypeError on the first draft step.
+        logger.info_once(
+            "flashinfer.top_k has an incompatible signature; vocab-parallel "
+            "top-k uses torch.topk, at roughly half the speed."
+        )
+        return None
 
     return top_k
 
@@ -51,6 +66,34 @@ def _topk(scores: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
     if impl is None or not scores.is_cuda:
         return torch.topk(scores, k, dim=-1)
     return impl(scores, k, sorted=True, deterministic=True)
+
+
+def _mask_vocab_padding(logits: torch.Tensor, shard_indices) -> None:
+    """Mask both per-shard padding regions ([org | org_pad | added | added_pad])."""
+    if shard_indices.num_org_vocab_padding > 0:
+        logits[
+            ...,
+            shard_indices.num_org_elements : shard_indices.num_org_elements_padded,
+        ] = -float("inf")
+    if shard_indices.num_added_vocab_padding > 0:
+        added_pad_start = (
+            shard_indices.num_org_elements_padded + shard_indices.num_added_elements
+        )
+        added_pad_end = (
+            shard_indices.num_org_elements_padded
+            + shard_indices.num_added_elements_padded
+        )
+        logits[..., added_pad_start:added_pad_end] = -float("inf")
+
+
+def _globalize_token_ids(ids: torch.Tensor, shard_indices) -> torch.Tensor:
+    """Shard-local indices -> global vocab ids, honoring the added-vocab slab."""
+    added_vocab_local_start = shard_indices.num_org_elements_padded
+    return torch.where(
+        ids >= added_vocab_local_start,
+        ids - added_vocab_local_start + shard_indices.added_vocab_start_index,
+        ids + shard_indices.org_vocab_start_index,
+    )
 
 
 # --8<-- [start:logits_processor]
@@ -256,6 +299,7 @@ class LogitsProcessor(PluggableLayer):
         hidden_states: torch.Tensor,
         k: int,
         embedding_bias: torch.Tensor | None = None,
+        local_logits: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Vocab-parallel top-k without all-gathering full logits.
 
@@ -266,6 +310,10 @@ class LogitsProcessor(PluggableLayer):
         Scale and soft cap are applied to the k selected values rather than
         the whole vocabulary; both are monotonic, so the selection is the same
         and only k entries are touched.
+
+        `local_logits` supplies this rank's shard logits when the caller has
+        already projected them (e.g. through a quantized draft head); the
+        masking, top-k and cross-rank merge are unchanged.
         """
         if self.scale <= 0.0 and self.scale != 1.0:
             raise ValueError(
@@ -273,16 +321,18 @@ class LogitsProcessor(PluggableLayer):
                 "non-positive logit scaling factors."
             )
 
-        logits = self._apply_head(lm_head, hidden_states, embedding_bias)
+        if local_logits is None:
+            logits = self._apply_head(lm_head, hidden_states, embedding_bias)
+        else:
+            logits = local_logits
 
-        # Mask out padding entries beyond org_vocab_size on this shard.
-        num_pad = lm_head.shard_indices.num_org_vocab_padding
-        if num_pad > 0:
-            logits[..., -num_pad:] = -float("inf")
+        _mask_vocab_padding(logits, lm_head.shard_indices)
 
         values, ids = _topk(logits, k)
-        # Convert shard-local indices to global vocab indices.
-        ids = ids.to(torch.int64) + lm_head.shard_indices.org_vocab_start_index
+        ids = _globalize_token_ids(ids.to(torch.int64), lm_head.shard_indices)
+        # fp32 before the cross-rank merge so shard-boundary ties are not
+        # resolved on head-dtype mantissas (matches get_top_tokens).
+        values = values.float()
 
         if lm_head.tp_size > 1:
             values = tensor_model_parallel_all_gather(values, dim=-1)
@@ -290,11 +340,11 @@ class LogitsProcessor(PluggableLayer):
             values, selected = _topk(values, k)
             ids = ids.gather(-1, selected)
 
-        values = values.float()
-        if self.scale != 1.0:
-            values = values * self.scale
+        # Softcap before scale, matching forward() and get_top_tokens.
         if self.soft_cap is not None:
             values = torch.tanh(values / self.soft_cap) * self.soft_cap
+        if self.scale != 1.0:
+            values = values * self.scale
         return ids, values
 
     def extra_repr(self) -> str:

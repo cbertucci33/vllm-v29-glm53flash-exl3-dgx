@@ -115,7 +115,8 @@ def test_b12x_backend_registration_priority_and_selection(
     assert names.index(before) < names.index(kernel_cls.__name__) < names.index(after)
 
     monkeypatch.setattr(linear_mod.current_platform, "_enum", PlatformEnum.CUDA)
-    monkeypatch.setattr(linear_mod, "_get_linear_backend", lambda: "b12x")
+    default_vllm_config.kernel_config.linear_backend = "b12x"
+    assert linear_mod._get_linear_backend() == "b12x"
     monkeypatch.setattr(
         kernel_cls,
         "is_supported",

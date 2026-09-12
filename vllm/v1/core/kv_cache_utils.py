@@ -10,7 +10,7 @@ from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
 from functools import partial
-from typing import Any, NamedTuple, NewType, TypeAlias, overload
+from typing import Any, NamedTuple, NewType, TypeAlias, cast, overload
 
 from vllm import envs
 from vllm.config import VllmConfig
@@ -22,8 +22,10 @@ from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     ChunkedLocalAttentionSpec,
+    DFlashSWASpec,
     FullAttentionSpec,
     HiddenStateCacheSpec,
+    KpoolTailSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheLayout,
@@ -728,6 +730,9 @@ def resolve_kv_cache_block_sizes(
     ]
     scheduler_block_size = math.lcm(*group_block_sizes)
 
+    logger.info("kv cache group sizes %s", group_block_sizes)
+    logger.info("kv lcm block sizes %s", scheduler_block_size)
+
     # Block hashes are only consumed by prefix caching and KV connectors
     # (P/D, offloading); when neither is active, keep hash_block_size equal
     # to the scheduler block size.
@@ -977,7 +982,7 @@ def check_enough_kv_cache_memory(
         # of the specs since grouping may unify them in-place.
         groups = get_kv_cache_groups(vllm_config, dict(kv_cache_spec))
         check_memory = (
-            available_memory - _pool_bytes_per_block(groups)
+            available_memory - _pool_bytes_per_block(groups, vllm_config)
             if groups
             else available_memory
         )
@@ -1050,13 +1055,11 @@ def get_max_concurrency_for_kv_cache_config(
     """
     Get the maximum concurrency for the given KV cache configuration.
 
-    A request at max_model_len consumes whole blocks from each group's block
-    table — cdiv(per-request bytes, page bytes) of the group's spec — and all
-    groups draw those block ids from one shared pool, so the per-request
-    total is the sum over groups. The memory/page ratio is identical whether
-    a group carries an aggregated UniformTypeKVCacheSpecs (worker config) or
-    a representative per-layer spec (scheduler config), so both capacity
-    call sites agree.
+    A request at max_model_len consumes whole blocks from each pool-backed
+    group's block table — cdiv(per-request bytes, page bytes) of the group's
+    spec — and those groups draw their block ids from one shared pool. Private
+    DFlash rings are allocated outside that pool and therefore contribute no
+    shared blocks here, matching DFlashRingManager's runtime ownership.
     """
     num_blocks_per_request = sum(
         cdiv(
@@ -1064,6 +1067,10 @@ def get_max_concurrency_for_kv_cache_config(
             group.kv_cache_spec.page_size_bytes,
         )
         for group in kv_cache_config.kv_cache_groups
+        if not (
+            type(group.kv_cache_spec) is DFlashSWASpec
+            and cast(DFlashSWASpec, group.kv_cache_spec).private_ring
+        )
     )
     max_concurrency = kv_cache_config.num_blocks / num_blocks_per_request
     return max_concurrency
@@ -1079,14 +1086,17 @@ def may_override_num_blocks(vllm_config: VllmConfig, num_blocks: int) -> int:
     return num_blocks
 
 
-def _pool_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
+def _pool_bytes_per_block(
+    kv_cache_groups: list[KVCacheGroupSpec],
+    vllm_config: VllmConfig | None = None,
+) -> int:
     """
     Bytes consumed by one block in the worker's shared KV cache pool, mirroring
     the divisor used by `get_kv_cache_config_from_groups` to convert
     `available_memory` into `num_blocks`. Used to compute the effective KV cache
     capacity once `num_gpu_blocks_override` is applied.
     """
-    return _get_kv_cache_bytes_per_block(kv_cache_groups)
+    return _get_kv_cache_bytes_per_block(vllm_config, kv_cache_groups)
 
 
 def get_uniform_page_size(kv_cache_specs: Iterable[KVCacheSpec]) -> int:
@@ -1130,6 +1140,309 @@ def _get_kv_cache_groups_uniform_type(
     """
 
     return [KVCacheGroupSpec(list(spec.kv_cache_specs.keys()), spec)]
+
+
+def _pp_balanced_mamba_group_count(
+    vllm_config: VllmConfig,
+    mamba_layer_names: list[str],
+    mla_layer_names: list[str],
+) -> int | None:
+    """Return a Mamba group count whose PP projections fit the MLA slots."""
+    num_groups = cdiv(len(mamba_layer_names), len(mla_layer_names))
+    pp_size = vllm_config.parallel_config.pipeline_parallel_size
+    if pp_size == 1:
+        return num_groups
+
+    from vllm.distributed.utils import get_pp_indices
+    from vllm.model_executor.models.utils import extract_layer_index
+
+    total_layers = vllm_config.model_config.get_total_num_hidden_layers()
+    mamba_indices = [extract_layer_index(name) for name in mamba_layer_names]
+    mla_indices = [extract_layer_index(name) for name in mla_layer_names]
+    for rank in range(pp_size):
+        start, end = get_pp_indices(total_layers, rank, pp_size)
+        num_mamba = sum(start <= index < end for index in mamba_indices)
+        num_mla = sum(start <= index < end for index in mla_indices)
+        if not num_mamba:
+            continue
+        if not num_mla:
+            return None
+        num_groups = max(num_groups, cdiv(num_mamba, num_mla))
+    return num_groups
+
+
+def _get_kv_cache_groups_glm5_next(
+    vllm_config: VllmConfig,
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> list[KVCacheGroupSpec] | None:
+    """Build GLM-5.3-Flash groups with Mamba/MLA and tail/indexer aliasing."""
+    mamba_specs = {
+        name: spec
+        for name, spec in kv_cache_spec.items()
+        if isinstance(spec, MambaSpec)
+    }
+    tail_specs = {
+        name: spec
+        for name, spec in kv_cache_spec.items()
+        if isinstance(spec, KpoolTailSpec)
+    }
+    attn_specs = {
+        name: spec
+        for name, spec in kv_cache_spec.items()
+        if not isinstance(spec, (MambaSpec, KpoolTailSpec))
+    }
+    # A DFlash draft adds plain full/sliding attention layers next to the
+    # target's MLA stack. They cannot share the MLA/indexer page layout, so
+    # they get their own groups and per-layer tensors.
+    draft_specs = {
+        name: spec
+        for name, spec in attn_specs.items()
+        if type(spec) in (FullAttentionSpec, SlidingWindowSpec, DFlashSWASpec)
+    }
+    if draft_specs:
+        spec_config = vllm_config.speculative_config
+        if spec_config is None or spec_config.method != "dflash":
+            return None
+        attn_specs = {
+            name: spec for name, spec in attn_specs.items() if name not in draft_specs
+        }
+    if not mamba_specs or not all(
+        type(spec) is MLAAttentionSpec for spec in attn_specs.values()
+    ):
+        return None
+
+    mla_specs = cast(dict[str, MLAAttentionSpec], attn_specs)
+    idx_pages = {
+        spec.page_size_bytes for spec in mla_specs.values() if spec.tokens_per_state > 1
+    }
+    if not idx_pages:
+        return None
+
+    assert all(spec.page_size_padded is None for spec in mla_specs.values())
+    assert len(idx_pages) == 1
+    mla_names = [name for name, spec in mla_specs.items() if spec.tokens_per_state == 1]
+    mla_pages = {mla_specs[name].page_size_bytes for name in mla_names}
+    assert len(mla_pages) == 1
+    mla_page = mla_pages.pop()
+    uniform_spec = UniformTypeKVCacheSpecs.from_specs(attn_specs)
+    assert uniform_spec is not None
+
+    tail_group: KVCacheGroupSpec | None = None
+    if tail_specs:
+        idx_page = next(iter(idx_pages))
+        padded_tail_specs: dict[str, KVCacheSpec] = {
+            name: replace(spec, page_size_padded=idx_page)
+            for name, spec in tail_specs.items()
+        }
+        tail_uniform = UniformTypeKVCacheSpecs.from_specs(padded_tail_specs)
+        assert tail_uniform is not None
+        tail_group = KVCacheGroupSpec(list(padded_tail_specs), tail_uniform)
+
+    any_mamba = next(iter(mamba_specs.values()))
+    assert all(spec == any_mamba for spec in mamba_specs.values())
+    if any_mamba.real_page_size_bytes > mla_page:
+        raise ValueError(
+            f"the mamba state page ({any_mamba.real_page_size_bytes} bytes) "
+            f"does not fit the MLA page ({mla_page} bytes); increase tensor "
+            "parallelism or use a wider KV cache dtype"
+        )
+    padded_specs: dict[str, KVCacheSpec] = {
+        name: replace(any_mamba, page_size_padded=mla_page) for name in mamba_specs
+    }
+    num_groups = _pp_balanced_mamba_group_count(
+        vllm_config, list(mamba_specs), mla_names
+    )
+    if num_groups is None:
+        raise ValueError(
+            "a pipeline stage has mamba layers but no MLA layer to share "
+            "slots with; realign the stage boundaries (VLLM_PP_LAYER_PARTITION)"
+        )
+    mamba_grouped_names: list[list[str]] = [[] for _ in range(num_groups)]
+    for index, name in enumerate(mamba_specs):
+        mamba_grouped_names[index % num_groups].append(name)
+
+    draft_groups: list[KVCacheGroupSpec] = []
+    if draft_specs:
+        private_dflash_ring = (
+            envs.VLLM_DFLASH_KV_RING
+            and vllm_config.kv_transfer_config is None
+            and all(type(spec) is DFlashSWASpec for spec in draft_specs.values())
+        )
+        if private_dflash_ring:
+            draft_specs = {
+                name: replace(cast(DFlashSWASpec, spec), private_ring=True)
+                for name, spec in draft_specs.items()
+            }
+        draft_buckets: dict[KVCacheSpec, list[str]] = defaultdict(list)
+        for name, spec in draft_specs.items():
+            draft_buckets[spec].append(name)
+        draft_groups = [
+            KVCacheGroupSpec(names, spec) for spec, names in draft_buckets.items()
+        ]
+        for group in draft_groups:
+            group.is_eagle_group = True
+            group.enable_kv_transfer = False
+
+    return (
+        [KVCacheGroupSpec(list(attn_specs), uniform_spec)]
+        + ([tail_group] if tail_group is not None else [])
+        + create_kv_cache_group_specs(padded_specs, mamba_grouped_names)
+        + draft_groups
+    )
+
+
+def _glm5_next_tensor_layout(
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> (
+    tuple[
+        KVCacheGroupSpec,
+        list[KVCacheGroupSpec],
+        list[str],
+        list[str],
+        int,
+        int,
+        list[str],
+        int,
+        list[KVCacheGroupSpec],
+    ]
+    | None
+):
+    """Recognize the GLM-5.3-Flash grouping after optional PP projection."""
+    uniform_groups = [
+        group
+        for group in kv_cache_groups
+        if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+    ]
+    mamba_groups = [
+        group for group in kv_cache_groups if isinstance(group.kv_cache_spec, MambaSpec)
+    ]
+    # DFlash draft groups carry the draft's plain full/sliding specs.
+    draft_groups = [
+        group
+        for group in kv_cache_groups
+        if type(group.kv_cache_spec)
+        in (FullAttentionSpec, SlidingWindowSpec, DFlashSWASpec)
+    ]
+    attn_group: KVCacheGroupSpec | None = None
+    tail_group: KVCacheGroupSpec | None = None
+    for group in uniform_groups:
+        inner = cast(UniformTypeKVCacheSpecs, group.kv_cache_spec).kv_cache_specs
+        if all(type(spec) is MLAAttentionSpec for spec in inner.values()):
+            attn_group = group
+        elif all(isinstance(spec, KpoolTailSpec) for spec in inner.values()):
+            tail_group = group
+    if attn_group is None or not mamba_groups:
+        return None
+    if len(uniform_groups) + len(mamba_groups) + len(draft_groups) != len(
+        kv_cache_groups
+    ):
+        return None
+
+    attn_uniform = cast(UniformTypeKVCacheSpecs, attn_group.kv_cache_spec)
+    mla_inner = cast(dict[str, MLAAttentionSpec], attn_uniform.kv_cache_specs)
+    if not all(
+        type(spec) is MLAAttentionSpec and spec.page_size_padded is None
+        for spec in mla_inner.values()
+    ):
+        return None
+    mla_names = [
+        name for name in attn_group.layer_names if mla_inner[name].tokens_per_state == 1
+    ]
+    idx_names = [
+        name for name in attn_group.layer_names if mla_inner[name].tokens_per_state > 1
+    ]
+    mla_pages = {mla_inner[name].page_size_bytes for name in mla_names}
+    idx_pages = {mla_inner[name].page_size_bytes for name in idx_names}
+    if len(mla_pages) != 1 or len(idx_pages) != 1:
+        return None
+    mla_page = mla_pages.pop()
+    idx_page = idx_pages.pop()
+    if any(group.kv_cache_spec.page_size_bytes != mla_page for group in mamba_groups):
+        return None
+
+    tail_names: list[str] = []
+    tail_page = 0
+    if tail_group is not None:
+        tail_names = list(tail_group.layer_names)
+        tail_inner = cast(
+            UniformTypeKVCacheSpecs, tail_group.kv_cache_spec
+        ).kv_cache_specs
+        tail_pages = {
+            cast(KpoolTailSpec, spec).unpadded_page_size_bytes
+            for spec in tail_inner.values()
+        }
+        if len(tail_pages) != 1 or len(tail_names) != len(idx_names):
+            return None
+        tail_page = tail_pages.pop()
+        if tail_page > idx_page:
+            return None
+
+    return (
+        attn_group,
+        mamba_groups,
+        mla_names,
+        idx_names,
+        mla_page,
+        idx_page,
+        tail_names,
+        tail_page,
+        draft_groups,
+    )
+
+
+def _dflash_ring_pages(
+    vllm_config: VllmConfig, draft_groups: list[KVCacheGroupSpec]
+) -> int | None:
+    """Return fixed physical pages per DFlash layer for the GLM ring lane."""
+    if not draft_groups:
+        return None
+    if vllm_config.kv_transfer_config is not None:
+        return None
+    if not all(
+        type(group.kv_cache_spec) is DFlashSWASpec
+        and cast(DFlashSWASpec, group.kv_cache_spec).private_ring
+        for group in draft_groups
+    ):
+        return None
+    max_admission = max(
+        cast(DFlashSWASpec, group.kv_cache_spec).max_admission_blocks_per_request(
+            max_in_flight_tokens=vllm_config.max_in_flight_tokens,
+            max_model_len=vllm_config.model_config.max_model_len,
+        )
+        for group in draft_groups
+    )
+    ring_size = max_admission + 1
+    return 1 + vllm_config.scheduler_config.max_num_seqs * ring_size
+
+
+def _dflash_ring_bytes(
+    vllm_config: VllmConfig, kv_cache_groups: list[KVCacheGroupSpec]
+) -> int:
+    glm5_layout = _glm5_next_tensor_layout(kv_cache_groups)
+    if glm5_layout is None:
+        return 0
+    draft_groups = glm5_layout[-1]
+    ring_pages = _dflash_ring_pages(vllm_config, draft_groups)
+    if ring_pages is None:
+        return 0
+    draft_bytes_per_page = sum(
+        group.kv_cache_spec.page_size_bytes * len(group.layer_names)
+        for group in draft_groups
+    )
+    return ring_pages * draft_bytes_per_page
+
+
+def dflash_ring_layer_names(
+    vllm_config: VllmConfig, kv_cache_groups: list[KVCacheGroupSpec]
+) -> set[str]:
+    """Return layers whose pages are ring-indexed rather than pool-indexed."""
+    glm5_layout = _glm5_next_tensor_layout(kv_cache_groups)
+    if glm5_layout is None:
+        return set()
+    ring_groups = glm5_layout[-1]
+    if _dflash_ring_pages(vllm_config, ring_groups) is None:
+        return set()
+    return {name for group in ring_groups for name in group.layer_names}
 
 
 def unify_kv_cache_spec_page_size(
@@ -1356,9 +1669,23 @@ def _get_per_layer_spec(
 
 
 def _get_kv_cache_bytes_per_block(
+    vllm_config: VllmConfig | None,
     kv_cache_groups: list[KVCacheGroupSpec],
 ) -> int:
     """Return the largest cache group's bytes per block."""
+    if (glm5_layout := _glm5_next_tensor_layout(kv_cache_groups)) is not None:
+        _, _, mla_names, idx_names, mla_page, idx_page, _, _, draft_groups = glm5_layout
+        base = len(mla_names) * mla_page + len(idx_names) * idx_page
+        if (
+            vllm_config is not None
+            and _dflash_ring_pages(vllm_config, draft_groups) is not None
+        ):
+            return base
+        return base + sum(
+            group.kv_cache_spec.page_size_bytes * len(group.layer_names)
+            for group in draft_groups
+        )
+
     bytes_per_block = max(
         sum(
             _get_per_layer_spec(group, layer_name).page_size_bytes
@@ -1432,9 +1759,106 @@ def get_kv_cache_config_from_groups(
             ),
         )
 
+    if (glm5_layout := _glm5_next_tensor_layout(kv_cache_groups)) is not None:
+        (
+            attn_group,
+            mamba_groups,
+            mla_names,
+            idx_names,
+            mla_page,
+            idx_page,
+            tail_names,
+            _,
+            draft_groups,
+        ) = glm5_layout
+        base_bytes_per_block = len(mla_names) * mla_page + len(idx_names) * idx_page
+        draft_bytes_per_page = sum(
+            group.kv_cache_spec.page_size_bytes * len(group.layer_names)
+            for group in draft_groups
+        )
+        ring_pages = _dflash_ring_pages(vllm_config, draft_groups)
+        fixed_draft_bytes = (
+            ring_pages * draft_bytes_per_page if ring_pages is not None else 0
+        )
+        bytes_per_block = (
+            base_bytes_per_block
+            if ring_pages is not None
+            else base_bytes_per_block + draft_bytes_per_page
+        )
+        num_blocks = may_override_num_blocks(
+            vllm_config,
+            max(available_memory - fixed_draft_bytes, 0) // bytes_per_block,
+        )
+        size = bytes_per_block * num_blocks + fixed_draft_bytes
+        attn_specs = cast(
+            UniformTypeKVCacheSpecs, attn_group.kv_cache_spec
+        ).kv_cache_specs
+
+        kv_cache_tensors: list[KVCacheTensor] = []
+
+        def add_tensor(
+            layer_name: str,
+            spec: KVCacheSpec,
+            offset: int,
+            storage_blocks: int = num_blocks,
+        ) -> None:
+            kv_cache_tensors.append(
+                KVCacheTensor(
+                    size=size,
+                    layers=[layer_name],
+                    layer_stride=spec.page_size_bytes * storage_blocks,
+                    block_stride=spec.page_size_bytes,
+                    offset=offset,
+                    num_blocks=storage_blocks,
+                )
+            )
+
+        for index, mla_name in enumerate(mla_names):
+            offset = index * mla_page * num_blocks
+            add_tensor(mla_name, attn_specs[mla_name], offset)
+            for group in mamba_groups:
+                if index < len(group.layer_names):
+                    add_tensor(group.layer_names[index], group.kv_cache_spec, offset)
+
+        idx_base = len(mla_names) * mla_page * num_blocks
+        for index, idx_name in enumerate(idx_names):
+            offset = idx_base + index * idx_page * num_blocks
+            add_tensor(idx_name, attn_specs[idx_name], offset)
+            if tail_names:
+                tail_name = tail_names[index]
+                tail_group = next(
+                    group for group in kv_cache_groups if tail_name in group.layer_names
+                )
+                tail_specs = cast(
+                    UniformTypeKVCacheSpecs, tail_group.kv_cache_spec
+                ).kv_cache_specs
+                add_tensor(tail_name, tail_specs[tail_name], offset)
+        draft_offset = idx_base + len(idx_names) * idx_page * num_blocks
+        draft_tensor_blocks = num_blocks if ring_pages is None else ring_pages
+        for group in draft_groups:
+            draft_page = group.kv_cache_spec.page_size_bytes
+            for draft_name in group.layer_names:
+                add_tensor(
+                    draft_name,
+                    group.kv_cache_spec,
+                    draft_offset,
+                    draft_tensor_blocks,
+                )
+                draft_offset += draft_page * draft_tensor_blocks
+        assert draft_offset == size
+
+        return KVCacheConfig(
+            num_blocks=num_blocks,
+            kv_cache_tensors=kv_cache_tensors,
+            kv_cache_groups=kv_cache_groups,
+            prefix_cache_retention_interval=(
+                vllm_config.cache_config.prefix_cache_retention_interval
+            ),
+        )
+
     layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
     validate_kv_cache_layout(layout, kv_cache_groups)
-    bytes_per_block = _get_kv_cache_bytes_per_block(kv_cache_groups)
+    bytes_per_block = _get_kv_cache_bytes_per_block(vllm_config, kv_cache_groups)
     interleaved_block_stride = bytes_per_block if layout.is_block_outermost else None
 
     num_blocks = available_memory // bytes_per_block
@@ -1931,6 +2355,9 @@ def get_kv_cache_groups(
         # full attention, or all layers are sliding window attention with the
         # same window size). Put all layers into one group.
         return _get_kv_cache_groups_uniform_type(uniform_spec)
+    elif glm5_groups := _get_kv_cache_groups_glm5_next(vllm_config, kv_cache_spec):
+        return glm5_groups
+
     # Hidden-state layers use their own block table and must not be absorbed
     # into a compatible attention bucket.
     hidden_specs = {
@@ -2055,7 +2482,42 @@ def _max_memory_usage_bytes_from_groups(
     if not kv_cache_groups:
         return 0
 
-    bytes_per_block = _pool_bytes_per_block(kv_cache_groups)
+    if (glm5_layout := _glm5_next_tensor_layout(kv_cache_groups)) is not None:
+        (
+            attn_group,
+            mamba_groups,
+            mla_names,
+            idx_names,
+            mla_page,
+            idx_page,
+            tail_names,
+            _,
+            draft_groups,
+        ) = glm5_layout
+        uniform_spec = cast(UniformTypeKVCacheSpecs, attn_group.kv_cache_spec)
+        total_blocks = uniform_spec.max_memory_usage_pages(vllm_config)
+        total_blocks += sum(
+            cdiv(
+                group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+                group.kv_cache_spec.page_size_bytes,
+            )
+            for group in mamba_groups
+        )
+        if tail_names:
+            total_blocks += 1
+        base_bytes_per_block = len(mla_names) * mla_page + len(idx_names) * idx_page
+        ring_bytes = _dflash_ring_bytes(vllm_config, kv_cache_groups)
+        if ring_bytes:
+            return total_blocks * base_bytes_per_block + ring_bytes
+        return total_blocks * (
+            base_bytes_per_block
+            + sum(
+                group.kv_cache_spec.page_size_bytes * len(group.layer_names)
+                for group in draft_groups
+            )
+        )
+
+    bytes_per_block = _pool_bytes_per_block(kv_cache_groups, vllm_config)
     total_blocks = 0
     for group in kv_cache_groups:
         spec = group.kv_cache_spec
@@ -2304,20 +2766,22 @@ def get_kv_cache_configs(
             if not groups:
                 adjusted_memory.append(avail_mem)
                 continue
-            bytes_per_block = _pool_bytes_per_block(groups)
+            bytes_per_block = _pool_bytes_per_block(groups, vllm_config)
             logger.info(
                 "Overriding num_gpu_blocks=%d with num_gpu_blocks_override=%d",
                 avail_mem // bytes_per_block,
                 override,
             )
-            adjusted_memory.append(override * bytes_per_block)
+            adjusted_memory.append(
+                override * bytes_per_block + _dflash_ring_bytes(vllm_config, groups)
+            )
         available_memory = adjusted_memory
 
     # Reserve the null block BlockPool permanently holds back, so auto-fit and
     # the capacity check both plan against usable blocks. Allocation below
     # still uses the full memory.
     check_memory = [
-        avail_mem - _pool_bytes_per_block(groups) if groups else avail_mem
+        avail_mem - _pool_bytes_per_block(groups, vllm_config) if groups else avail_mem
         for groups, avail_mem in zip(projected_groups_per_worker, available_memory)
     ]
 
@@ -2361,7 +2825,10 @@ def get_kv_cache_configs(
         # strides and offsets stay consistent with the shrunken allocation.
         groups = kv_cache_config.kv_cache_groups
         kv_cache_configs[i] = get_kv_cache_config_from_groups(
-            vllm_config, groups, min_num_blocks * _pool_bytes_per_block(groups)
+            vllm_config,
+            groups,
+            min_num_blocks * _pool_bytes_per_block(groups, vllm_config)
+            + _dflash_ring_bytes(vllm_config, groups),
         )
 
     return kv_cache_configs

@@ -10,24 +10,35 @@ per-layer causality, and the no-``layer_types`` fallback) is worth pinning.
 from types import SimpleNamespace
 
 import pytest
+import torch
 
+from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.models.qwen3_dflash import (
+    DFlashAttention,
     _dflash_layer_causal,
     _get_dflash_fc_input_size,
     dflash_has_any_non_causal,
 )
+from vllm.v1.kv_cache_interface import DFlashSWASpec, SlidingWindowSpec
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     get_eagle3_aux_layers_from_config,
 )
 
 
-def _config(num_hidden_layers, layer_types=None, causal_override=None, is_causal=None):
+def _config(
+    num_hidden_layers,
+    layer_types=None,
+    causal_override=None,
+    is_causal=None,
+    architectures=None,
+):
     dflash_config = None if causal_override is None else {"causal": causal_override}
     return SimpleNamespace(
         num_hidden_layers=num_hidden_layers,
         layer_types=layer_types,
         dflash_config=dflash_config,
         is_causal=is_causal,
+        architectures=architectures,
     )
 
 
@@ -47,11 +58,23 @@ def _config(num_hidden_layers, layer_types=None, causal_override=None, is_causal
                 2,
                 layer_types=["sliding_attention"] * 2,
                 is_causal=False,
+                architectures=["DFlash2DraftModel"],
             ),
             True,
         ),
         (
-            _config(2, layer_types=["full_attention"] * 2, is_causal=True),
+            _config(
+                2,
+                layer_types=["full_attention"] * 2,
+                is_causal=True,
+                architectures=["DFlash2DraftModel"],
+            ),
+            False,
+        ),
+        # A v1 draft config carrying a stray is_causal (this fork overloads
+        # that attr for pooling models) must keep its layer_types derivation.
+        (
+            _config(2, layer_types=["sliding_attention"] * 2, is_causal=False),
             False,
         ),
         # SWA-derived: full-attention layers are non-causal.
@@ -67,6 +90,26 @@ def test_dflash_has_any_non_causal(config, expected):
     assert dflash_has_any_non_causal(config) is expected
 
 
+def test_dflash_spec_drops_target_page_padding(monkeypatch):
+    padded = SlidingWindowSpec(
+        block_size=16,
+        num_kv_heads=4,
+        head_size=128,
+        dtype=torch.float8_e4m3fn,
+        sliding_window=32_768,
+        page_size_padded=4_718_592,
+    )
+    monkeypatch.setattr(Attention, "get_kv_cache_spec", lambda *_args: padded)
+
+    attention = object.__new__(DFlashAttention)
+    spec = attention.get_kv_cache_spec(SimpleNamespace())
+
+    assert isinstance(spec, DFlashSWASpec)
+    assert spec.block_size == 16
+    assert spec.page_size_padded is None
+    assert spec.page_size_bytes == 16_384
+
+
 def test_dflash_layer_causal_is_per_layer():
     config = _config(2, layer_types=["sliding_attention", "full_attention"])
     assert _dflash_layer_causal(config, 0) is True
@@ -78,8 +121,19 @@ def test_dflash_layer_causal_honors_top_level_override():
         2,
         layer_types=["sliding_attention", "full_attention"],
         is_causal=False,
+        architectures=["DFlash2DraftModel"],
     )
     assert _dflash_layer_causal(config, 0) is False
+    assert _dflash_layer_causal(config, 1) is False
+
+
+def test_dflash_layer_causal_ignores_is_causal_on_v1_drafts():
+    config = _config(
+        2,
+        layer_types=["sliding_attention", "full_attention"],
+        is_causal=True,
+    )
+    assert _dflash_layer_causal(config, 0) is True
     assert _dflash_layer_causal(config, 1) is False
 
 

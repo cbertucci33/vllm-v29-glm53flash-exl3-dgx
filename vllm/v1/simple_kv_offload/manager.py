@@ -207,6 +207,7 @@ class SimpleCPUOffloadScheduler:
                 layer_stride=t.layer_stride,
                 block_stride=t.block_stride,
                 offset=t.offset,
+                num_blocks=t.num_blocks,
             )
             for t in gpu_config.kv_cache_tensors
         ]

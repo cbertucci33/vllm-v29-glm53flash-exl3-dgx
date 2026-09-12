@@ -12,6 +12,9 @@ from vllm.triton_utils import HAS_TRITON, tl, tldevice, triton
 # available — on the CPU worker path `tl` is a placeholder whose `constexpr`
 # attribute is `None`, and `tl.constexpr(...)` would crash at import time.
 _TL_RAND_MIN = tl.constexpr(4.6566127342e-10) if HAS_TRITON else 4.6566127342e-10
+_FP64_ONE_MINUS_EPS = (
+    tl.constexpr(0.9999999999999999) if HAS_TRITON else 0.9999999999999999
+)
 
 # Offset salt keeping the draft's Gumbel noise disjoint from the target's.
 # Verification is a probability-ratio test, not a Gumbel coupling, so a proposal
@@ -102,8 +105,10 @@ def gumbel_noised_argmax(
     """Argmax of logits under Gumbel-max sampling, or plain argmax at temp 0.
 
     `keys` indexes the noise, so the same token draws the same noise wherever it
-    appears; `pos` and `seed` place the draw in the request's stream, which is
-    what lets a draft and its verification agree.
+    appears; `pos` and `seed` place the draw in the request's stream. The caller
+    chooses the position key: draft-side callers must salt it with
+    DRAFT_GUMBEL_POS_OFFSET (spec_decode/utils.py) so proposal noise stays on a
+    Philox range disjoint from the verifier's acceptance/recovery stream.
     """
     if temp != 0.0 and APPLY_TEMPERATURE:
         # Match the behavior of _temperature_kernel: if that kernel uses
@@ -120,6 +125,9 @@ def gumbel_noised_argmax(
         gumbel_seed = tl.randint(seed, pos)
         if USE_FP64:
             u = tl_rand64(gumbel_seed, keys, includes_zero=False)
+            # Clamp the top end as gumbel_block_argmax does: a max-word draw
+            # can round to exactly 1.0 in fp64, making the noise +inf.
+            u = tl.minimum(u, _FP64_ONE_MINUS_EPS)
             gumbel_noise = -tl.log(-tl.log(u))
         else:
             u = tl_rand32(gumbel_seed, keys, includes_zero=False)

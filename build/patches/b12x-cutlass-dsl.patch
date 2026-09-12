@@ -1,0 +1,46 @@
+diff --git a/b12x/gemm/mxfp8_linear/api.py b/b12x/gemm/mxfp8_linear/api.py
+index 76a6b0a1..bcaafbf4 100644
+--- a/b12x/gemm/mxfp8_linear/api.py
++++ b/b12x/gemm/mxfp8_linear/api.py
+@@ -24,3 +24,2 @@ def is_supported(device=None) -> bool:
+-    return default_is_supported(device, requires=META.requires) and bool(
+-        _kernel_is_supported()
+-    )
++    kernel_is_supported, _ = _kernel_is_supported()
++    return default_is_supported(device, requires=META.requires) and kernel_is_supported
+diff --git a/pyproject.toml b/pyproject.toml
+index d31c6070..8bc600b7 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -13,5 +13,5 @@ dependencies = [
+-  "nvidia-cutlass-dsl==4.6.2",
+-  "nvidia-cutlass-dsl-libs-base==4.6.2",
+-  "nvidia-cutlass-dsl-libs-core==4.6.2",
+-  "nvidia-cutlass-dsl-libs-cu12==4.6.2",
+-  "nvidia-cutlass-dsl-libs-cu13==4.6.2",
++  "nvidia-cutlass-dsl>=4.7.0,<5",
++  "nvidia-cutlass-dsl-libs-base>=4.7.0,<5",
++  "nvidia-cutlass-dsl-libs-core>=4.7.0,<5",
++  "nvidia-cutlass-dsl-libs-cu12>=4.7.0,<5",
++  "nvidia-cutlass-dsl-libs-cu13>=4.7.0,<5",
+diff --git a/tests/gemm/test_mxfp8_linear.py b/tests/gemm/test_mxfp8_linear.py
+index ab5ea2b8..90a6c711 100644
+--- a/tests/gemm/test_mxfp8_linear.py
++++ b/tests/gemm/test_mxfp8_linear.py
+@@ -15,0 +16 @@ from b12x.gemm import mxfp8_linear
++from b12x.gemm.mxfp8_linear import api as mxfp8_linear_api
+@@ -63,0 +65,14 @@ def _reference_from_packed(source: torch.Tensor, packed_weight) -> torch.Tensor:
++def test_is_supported_honors_kernel_probe(monkeypatch) -> None:
++    monkeypatch.setattr(
++        mxfp8_linear_api,
++        "default_is_supported",
++        lambda *args, **kwargs: True,
++    )
++    monkeypatch.setattr(
++        mxfp8_linear_api,
++        "_kernel_is_supported",
++        lambda: (False, "MXFP8 MMA unavailable"),
++    )
++    assert not mxfp8_linear_api.is_supported()
++
++

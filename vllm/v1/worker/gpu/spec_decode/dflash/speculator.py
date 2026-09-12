@@ -15,7 +15,11 @@ from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import (
+    DFlashSWASpec,
+    KVCacheConfig,
+    get_kv_cache_spec_sliding_window,
+)
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cp_utils import cp_local_slot
@@ -23,7 +27,10 @@ from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import DFlashCudaGraphManager
-from vllm.v1.worker.gpu.spec_decode.dflash.utils import load_dflash_model
+from vllm.v1.worker.gpu.spec_decode.dflash.utils import (
+    get_dflash_cache_config,
+    load_dflash_model,
+)
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.gpu.spec_decode.utils import get_parallel_drafting_token_id
 from vllm.v1.worker.utils import AttentionGroup
@@ -100,6 +107,7 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
         self.draft_kv_cache_group_id: int = -1
+        self.draft_ring_size: dict[int, int] = {}
 
     @property
     def attn_vllm_config(self) -> VllmConfig:
@@ -109,6 +117,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.vllm_config.attention_config,
             use_non_causal=self.requires_non_causal,
         )
+        config.cache_config = get_dflash_cache_config(self.vllm_config)
         return config
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
@@ -178,11 +187,42 @@ class DFlashSpeculator(DraftModelSpeculator):
             target_attn_groups,
         )
 
+        # FlashAttention's AOT split schedule is wrong for a windowed drafter,
+        # and `_get_sliding_window_configs` leaves it on or off depending on
+        # whether the target also runs FlashAttention. Decide it here instead.
+        for groups in self.attn_groups:
+            for group in groups:
+                builder = group.get_metadata_builder()
+                if getattr(
+                    builder, "aot_schedule", False
+                ) and get_kv_cache_spec_sliding_window(builder.kv_cache_spec):
+                    # `aot_schedule` belongs to FlashAttention's builder, not
+                    # to the base class this loop is typed against.
+                    builder.aot_schedule = False  # type: ignore[attr-defined]
+
         self.draft_kv_cache_group_ids = [
             gid for gid, g in enumerate(self.attn_groups) if g
         ]
         assert self.draft_kv_cache_group_ids, "No draft attention groups found."
         self.draft_kv_cache_group_id = self.draft_kv_cache_group_ids[0]
+
+        for gid in self.draft_kv_cache_group_ids:
+            group = kv_cache_config.kv_cache_groups[gid]
+            if type(group.kv_cache_spec) is not DFlashSWASpec:
+                continue
+            page_size = group.kv_cache_spec.page_size_bytes
+            layer_names = set(group.layer_names)
+            tensor = next(
+                tensor
+                for tensor in kv_cache_config.kv_cache_tensors
+                if layer_names.intersection(tensor.layers)
+            )
+            pages = tensor.layer_stride // page_size
+            if pages == kv_cache_config.num_blocks:
+                continue
+            ring_size = (pages - 1) // self.max_num_reqs
+            assert ring_size > 0 and 1 + self.max_num_reqs * ring_size == pages
+            self.draft_ring_size[gid] = ring_size
 
         # Per-group context slot buffers for the precompute (one row per group).
         self._context_slot_mappings = torch.zeros(
@@ -377,6 +417,15 @@ class DFlashSpeculator(DraftModelSpeculator):
         # The query slot mapping is written into the shared BlockTables slot_mappings.
         # That buffer's address is what the captured CUDA graph reads from at replay.
         assert self.draft_kv_cache_group_id >= 0
+        if self.draft_ring_size:
+            for gid, ring_size in self.draft_ring_size.items():
+                synthesize_draft_ring_block_tables(
+                    self.block_tables.input_block_tables[gid],
+                    input_batch.idx_mapping,
+                    input_batch.seq_lens,
+                    self.block_tables.kernel_block_sizes[gid],
+                    ring_size,
+                )
         # Support multiple draft KV cache groups by preparing inputs once for each
         for i, gid in enumerate(self.draft_kv_cache_group_ids):
             prepare_dflash_inputs(
@@ -479,6 +528,48 @@ class DFlashSpeculator(DraftModelSpeculator):
             )
 
         return self.draft_tokens[:num_reqs]
+
+
+@triton.jit
+def _synthesize_draft_ring_block_tables_kernel(
+    block_table_ptr,
+    block_table_stride,
+    idx_mapping_ptr,
+    seq_lens_ptr,
+    block_size,
+    ring_size,
+    BLOCK_SIZE: tl.constexpr,
+):
+    batch_idx = tl.program_id(0)
+    req_state_idx = tl.load(idx_mapping_ptr + batch_idx)
+    seq_len = tl.load(seq_lens_ptr + batch_idx)
+    num_blocks = (seq_len + block_size - 1) // block_size
+    row_ptr = block_table_ptr + batch_idx.to(tl.int64) * block_table_stride
+    base = 1 + req_state_idx * ring_size
+    for start in tl.range(0, block_table_stride, BLOCK_SIZE):
+        offsets = start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < block_table_stride
+        ring_ids = tl.where(offsets < num_blocks, base + offsets % ring_size, 0)
+        tl.store(row_ptr + offsets, ring_ids, mask=mask)
+
+
+def synthesize_draft_ring_block_tables(
+    block_table: torch.Tensor,
+    idx_mapping: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_size: int,
+    ring_size: int,
+) -> None:
+    """Build a draft block table directly from the request-local ring."""
+    _synthesize_draft_ring_block_tables_kernel[(idx_mapping.shape[0],)](
+        block_table,
+        block_table.stride(0),
+        idx_mapping,
+        seq_lens,
+        block_size,
+        ring_size,
+        BLOCK_SIZE=256,  # type: ignore
+    )
 
 
 @triton.jit

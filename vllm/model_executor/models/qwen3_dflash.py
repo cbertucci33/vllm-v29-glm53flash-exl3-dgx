@@ -35,6 +35,8 @@ from vllm.multimodal.inputs import NestedTensors
 from vllm.transformers_utils.config import set_default_rope_theta
 from vllm.transformers_utils.repo_utils import get_hf_file_bytes
 from vllm.v1.attention.backend import AttentionType
+from vllm.v1.kv_cache_interface import DFlashSWASpec, KVCacheSpec, SlidingWindowSpec
+from vllm.v1.kv_cache_interface import replace_as as replace_kv_spec
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     get_eagle3_aux_layers_from_config,
 )
@@ -57,8 +59,14 @@ _SLIDING_ATTENTION = "sliding_attention"
 
 def _dflash_layer_causal(config: Qwen3Config, layer_idx: int) -> bool:
     """Resolve explicit causality before falling back to legacy layer defaults."""
+    # Top-level is_causal is honored only for DFlash2 checkpoints (which store
+    # their attention semantics there). This fork already uses hf_config
+    # is_causal to mean bidirectional-vs-causal for pooling models, so a bare
+    # attribute on a v1 draft config must not flip its layer_types derivation.
     is_causal = getattr(config, "is_causal", None)
-    if is_causal is not None:
+    if is_causal is not None and "DFlash2DraftModel" in (
+        getattr(config, "architectures", None) or []
+    ):
         return bool(is_causal)
     override = (getattr(config, "dflash_config", None) or {}).get("causal")
     if override is not None:
@@ -149,6 +157,24 @@ def _resolve_layer_attention(
     return sliding_window, _dflash_layer_causal(config, layer_idx)
 
 
+class DFlashAttention(Attention):
+    """Mark DFlash sliding-window layers for bounded ring allocation."""
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+        spec = super().get_kv_cache_spec(vllm_config)
+        if isinstance(spec, SlidingWindowSpec):
+            # DFlash draft caches have their own bounded ring allocation and
+            # may use a smaller page than the target cache.  Do not inherit
+            # the generic skip-layer shared-page padding: doing so charges and
+            # allocates one target-sized page for every 16 draft tokens.
+            return replace_kv_spec(
+                spec,
+                DFlashSWASpec,
+                page_size_padded=None,
+            )
+        return spec
+
+
 class DFlashQwen3Attention(nn.Module):
     """Attention for DFlash speculative decoding.
 
@@ -224,7 +250,7 @@ class DFlashQwen3Attention(nn.Module):
         )
 
         self.sliding_window = sliding_window
-        self.attn = Attention(
+        self.attn = DFlashAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,
@@ -461,6 +487,43 @@ class DFlashQwen3Model(nn.Module):
             embeds = torch.where(is_mask, self.mask_embedding.to(embeds.dtype), embeds)
         return embeds
 
+    def _kv_projection_rows(self, attn: nn.Module) -> torch.Tensor:
+        """K/V rows of ``qkv_proj.weight`` in the model compute dtype.
+
+        MXFP8-quantized drafts (e.g. ModelOpt DFlash2 exports) hold
+        ``qkv_proj`` as FP8 values plus per-32-block E8M0 scales. The fused
+        context-KV GEMM needs plain rows, so dequantize the K/V slice here.
+        This runs at the end of ``load_weights``, before
+        ``process_weights_after_loading`` repacks the quantized weight into a
+        kernel-specific layout that can no longer be row-sliced.
+        """
+        weight = attn.qkv_proj.weight
+        rows = weight[attn.q_size :]
+        if weight.dtype != torch.float8_e4m3fn:
+            return rows
+
+        from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+            MXFP8_BLOCK_SIZE,
+            MXFP8_SCALE_DTYPE,
+            dequant_mxfp8_to_bf16,
+        )
+
+        scales = getattr(attn.qkv_proj, "weight_scale", None)
+        expected_scale_shape = (weight.shape[0], weight.shape[1] // MXFP8_BLOCK_SIZE)
+        if (
+            scales is None
+            or scales.dtype != MXFP8_SCALE_DTYPE
+            or tuple(scales.shape) != expected_scale_shape
+        ):
+            raise ValueError(
+                "DFlash draft qkv_proj is FP8 but has no ModelOpt MXFP8 "
+                f"weight_scale of shape {expected_scale_shape}; cannot build "
+                "the fused context-KV projection from it."
+            )
+        return dequant_mxfp8_to_bf16(
+            rows.contiguous(), scales[attn.q_size :].contiguous()
+        ).to(self.hidden_norm.weight.dtype)
+
     def _build_context_kv_buffers(
         self,
         layers_attn: list[nn.Module],
@@ -469,7 +532,7 @@ class DFlashQwen3Model(nn.Module):
         self._hidden_norm_weight = self.hidden_norm.weight.data
 
         # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
-        kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
+        kv_weights = [self._kv_projection_rows(a) for a in layers_attn]
         self._fused_kv_weight = torch.cat(kv_weights, dim=0)
         if has_bias:
             kv_biases = [a.qkv_proj.bias[a.q_size :] for a in layers_attn]
@@ -835,8 +898,17 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             orig_to_new_substr["mask_embedding"] = None
         mapper = WeightsMapper(orig_to_new_substr=orig_to_new_substr)
         loader = AutoWeightsLoader(self)
-        loader.load_weights(model_weights.items(), mapper=mapper)
+        loaded = loader.load_weights(model_weights.items(), mapper=mapper)
         self.model._build_fused_kv_buffers()
+        if not self.model.has_separate_mask_embedding:
+            # Without a mask_embedding.pt override the parameter stays a zero
+            # buffer that embed_input_ids never reads; count it as accounted
+            # for so the strict check below doesn't reject the checkpoint.
+            loaded.add("model.mask_embedding")
+        # Return the loaded-name set so track_weights_loading can flag any
+        # module parameter the checkpoint never provided (else e.g. selector
+        # codebooks would silently keep their torch.empty garbage).
+        return loaded
 
     def _read_mask_embedding(self) -> torch.Tensor | None:
         """Checks for an override mask embedding in `mask_embedding.pt` and returns it.

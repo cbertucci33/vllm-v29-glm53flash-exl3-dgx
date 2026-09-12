@@ -59,6 +59,8 @@ if TYPE_CHECKING:
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
+    VLLM_DFLASH_FP8_DRAFT_HEAD: bool = False
+    VLLM_DFLASH_KV_RING: bool = True
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
     VLLM_USE_RAY_WRAPPED_PP_COMM: bool = True
@@ -189,6 +191,7 @@ if TYPE_CHECKING:
     VLLM_HUMMING_USE_F16_ACCUM: bool = False
     VLLM_HUMMING_MOE_GEMM_TYPE: Literal["indexed", "grouped", "auto"] | None = None
     VLLM_B12X_MOE_FP4_FORCE_A16: bool = False
+    VLLM_B12X_MXFP8_MAX_M: int = 16
     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
     VLLM_V1_USE_OUTLINES_CACHE: bool = False
     VLLM_TPU_USING_PATHWAYS: bool = False
@@ -1084,6 +1087,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN": lambda: int(
         os.getenv("VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN", "8192")
     ),
+    # Compute DFlash2 proposal logits with a rowwise-FP8 copy of the shared
+    # target LM head. Target verification remains unquantized.
+    "VLLM_DFLASH_FP8_DRAFT_HEAD": lambda: bool(
+        int(os.getenv("VLLM_DFLASH_FP8_DRAFT_HEAD", "0"))
+    ),
+    # Back GLM DFlash sliding-window KV with bounded per-request page rings.
+    "VLLM_DFLASH_KV_RING": lambda: os.getenv("VLLM_DFLASH_KV_RING", "1") == "1",
     # If set, the OpenAI API server will stay alive even after the underlying
     # AsyncLLMEngine errors and stops serving requests
     "VLLM_KEEP_ALIVE_ON_ENGINE_DEATH": lambda: bool(
@@ -1614,6 +1624,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Force b12x FP4 MoE to use BF16 activations.
     "VLLM_B12X_MOE_FP4_FORCE_A16": lambda: bool(
         int(os.getenv("VLLM_B12X_MOE_FP4_FORCE_A16", "0"))
+    ),
+    # Use the native B12X dense MXFP8 GEMM through this row count. Larger
+    # supported shapes use the FlashInfer CUTLASS implementation.
+    "VLLM_B12X_MXFP8_MAX_M": lambda: int(
+        os.getenv("VLLM_B12X_MXFP8_MAX_M", "16")
     ),
     # Allow use of FlashInfer MxInt4 MoE kernels for fused moe ops.
     "VLLM_USE_FLASHINFER_MOE_INT4": lambda: bool(
@@ -2170,6 +2185,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Each op additionally checks its own shape / dtype constraints and falls
     # back to the eager path when they do not hold.
     "VLLM_ENABLE_HPC_OPS": lambda: bool(int(os.getenv("VLLM_ENABLE_HPC_OPS", "0"))),
+    # --- EXL3 Trellis MoE runtime knobs (read directly by
+    # model_executor/layers/quantization/exl3.py; registered here so startup
+    # does not flag them as unknown). The Trellis window starts at one row for
+    # both target and draft layers.
+    "VLLM_EXL3_TRELLIS_MIN_M": lambda: os.getenv("VLLM_EXL3_TRELLIS_MIN_M"),
+    "VLLM_EXL3_TRELLIS_MAX_M": lambda: os.getenv("VLLM_EXL3_TRELLIS_MAX_M"),
+    "VLLM_EXL3_TRELLIS_BLOCK_M": lambda: os.getenv("VLLM_EXL3_TRELLIS_BLOCK_M"),
+    "VLLM_EXL3_PREFILL_BLOCK_M": lambda: os.getenv("VLLM_EXL3_PREFILL_BLOCK_M"),
+    # Prebuilt exllamav3 extension location and torch-ABI compatibility shim.
+    "VLLM_EXL3_EXT_PATH": lambda: os.getenv("VLLM_EXL3_EXT_PATH"),
+    "VLLM_EXL3_ABI_SHIM": lambda: os.getenv("VLLM_EXL3_ABI_SHIM"),
+    # Calibrated MLA outer scales for the nvfp4_ds_mla KV cache.
+    "VLLM_NVFP4_MLA_SCALES_FILE": lambda: os.getenv("VLLM_NVFP4_MLA_SCALES_FILE"),
+
 }
 
 

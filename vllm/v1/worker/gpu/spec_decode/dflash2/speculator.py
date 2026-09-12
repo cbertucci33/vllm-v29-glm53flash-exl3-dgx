@@ -10,6 +10,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_argmax
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+from vllm.v1.worker.gpu.spec_decode.utils import DRAFT_GUMBEL_POS_OFFSET
 
 
 @triton.jit
@@ -27,6 +28,7 @@ def _selector_walk_kernel(
     BLOCK_K: tl.constexpr,
     SAMPLE_PROBABILISTIC: tl.constexpr,
     USE_FP64: tl.constexpr,
+    POS_OFFSET: tl.constexpr,
 ):
     row = tl.program_id(0)
     offsets = tl.arange(0, BLOCK_K)
@@ -51,9 +53,13 @@ def _selector_walk_kernel(
             other=0,
         )
 
-        # sample_pos is the predicted token's position P. Sampling keys a draw
-        # by the position before the sampled token, P-1.
-        sample_pos = tl.load(sample_pos_ptr + flat) - 1
+        # Candidate ids key the noise. The position is salted onto the draft
+        # Philox range (see draft_gumbel_pos): the verifier keys its acceptance
+        # uniform and recovery Gumbel for predicted position Q by offset Q-1,
+        # so an unsalted Q-1 here would reuse the verifier's exact noise words
+        # and bias rejection sampling. Effective key = Q-1 + offset, matching
+        # the v1 drafter's stream.
+        sample_pos = tl.load(sample_pos_ptr + flat) - 1 + POS_OFFSET
         _, index = gumbel_noised_argmax(
             scores,
             candidates,
@@ -113,6 +119,16 @@ class DFlash2Speculator(DFlashSpeculator):
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
+        if self.speculative_config.uses_dynamic_speculative_decoding():
+            # Dynamic depths make the CUDA-graph manager capture per-depth
+            # decode buckets; the selector walk kernel runs at fixed full
+            # depth, so those captures would trip the _generate_draft assert
+            # mid-boot. Refuse up front instead.
+            raise ValueError(
+                "DFlash2 drafts at a fixed physical depth; "
+                "num_speculative_tokens_per_batch_size and "
+                "adaptive_speculative_tokens_window are not supported."
+            )
         draft_config = self.draft_model_config.hf_config.dflash_config
         self.selector_top_k = int(draft_config["selector_top_k"])
         self._anchor_indices = (
@@ -157,6 +173,7 @@ class DFlash2Speculator(DFlashSpeculator):
             BLOCK_K=block_k,
             SAMPLE_PROBABILISTIC=self.draft_logits is not None,
             USE_FP64=self.use_fp64_gumbel,
+            POS_OFFSET=DRAFT_GUMBEL_POS_OFFSET,
             num_warps=1,
         )
 
