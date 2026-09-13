@@ -1,79 +1,86 @@
 # GLM-5.3 Flash EXL3 on DGX Spark
 
-This repository extends vLLM 0.29.0 to serve GLM-5.3 Flash EXL3 checkpoints
-on NVIDIA DGX Spark. It includes native SM120 sparse attention, tensor-parallel
-EXL3 checkpoint slicing and loading, DFlash2 speculative decoding, and the
-cache lifecycle changes required by that combination.
+This repository records the work required to serve a rank-sliced GLM-5.3 Flash EXL3 checkpoint with DFlash2 speculative decoding on two NVIDIA DGX Spark systems. It is based on vLLM 0.29.0. Model weights are published separately.
 
-Model weights are published separately. The source checkpoint and the DFlash2
-checkpoint remain subject to their own licenses.
+The runner supports GLM chat, reasoning, tools, multimodal input, hybrid KDA, native sparse MLA on GB10, EXL3 tensor parallelism, and DFlash2. It does not hard-code a context length, concurrency limit, KV-cache allocation, network address, or model path.
 
-## Component versions
+## How the runner was built
 
-| Component | Version or revision | Use |
-| --- | --- | --- |
-| vLLM | `0.29.0`, commit `98dff2a81d747d1dba01a47f939f48c3526d4206` | Runtime base |
-| Official vLLM image | `vllm/vllm-openai:v0.29.0@sha256:c2914767605584b6d8f45686b82de173ecc99e781897aa3d0a66dacd72c51ae1` | Runtime stage |
-| CUDA development image | `nvidia/cuda:13.0.2-devel-ubuntu24.04@sha256:5dc1bca23d05bd37b011be68ec470c03b403a5da07ec3a86e41af9470e9d0cc6` | Build toolchain |
-| CUTLASS C++ source | `da5e086dab31d63815acafdac9a9c5893b1c69e2` | vLLM CUDA extension |
-| FlashInfer | `0.6.18`, commit `5cc867a9bb560bc89b91dbc738a9f63f09beb89b` | SM120 sparse attention and TopK |
-| FlashInfer CCCL | `16bd510c9b712e82b0ab6cbb630d8e29ba1f7116` | Pinned source dependency |
-| FlashInfer CUTLASS | `b46b16d003484063bca4ed365e44095c4c6ed633` | Pinned source dependency |
-| FlashInfer spdlog | `c3aed4b68373955e1cc94307683d44dca1515d2b` | Pinned source dependency |
-| Sparkinfer | commit `d4438d490691f79022fdfc8149e1c5f161d15445` | Tensor-parallel EXL3 execution |
-| ExLlamaV3 | commit `c5d9c657966ffeeaa9353f0cc899f18629da4a13` | EXL3 extension, format `0.0.43` |
-| B12X | `1.2.6`, commit `ab6eea89b5b5e334ac6e9f2c503c1de60c3f216c` | Dense MXFP8 linear kernels |
-| NVIDIA CUTLASS DSL | `4.7.0` | Kernel build dependency |
-| GLM chat template | Z.ai revision `690b705278a3a58e538fcb37c2ca8b5f9511213c` | Chat, tool, vision, and reasoning syntax |
+This is the integration history from unmodified vLLM to the tested runner. The order matters because later fixes depend on cache layouts and native interfaces established earlier.
 
-`build/versions.env` contains the machine-readable pins. External sources and
-build wheels are downloaded separately; they are not vendored in this
-repository.
+1. **Started from vLLM 0.29.0.** The source base is tag `v0.29.0`, commit `98dff2a81d747d1dba01a47f939f48c3526d4206`. The runtime starts from the official `vllm/vllm-openai:v0.29.0` image pinned by digest.
 
-## Changes from vLLM 0.29.0
+2. **Added the GLM-5.3 Flash architecture.** Imported the model work from vLLM PR #53906, including hybrid KDA and NoPE sparse MLA, multimodal processing, MTP, configuration classes, registry entries, and weight-loading rules.
 
-1. **GLM-5.3 model support.** The model implementation includes hybrid KDA,
-   NoPE sparse MLA, multimodal input, MTP, and the GLM parser and configuration
-   surface.
-2. **Native SM120 attention.** The target uses FlashInfer's `GLM53_NOPE`
-   backend with packed FP8 cache records and physical sparse page tables.
-3. **Lossless tensor-parallel EXL3 slicing.** The included converter splits
-   routed expert tensors without dequantization, calibration, or
-   requantization. It reconstructs every source tensor bit for bit before
-   publishing the output.
-4. **Tensor-parallel EXL3 loading.** The loader normalizes target and draft
-   tensor names and dispatches supported rank-sliced shapes through
-   Sparkinfer's Trellis interface.
-5. **DFlash2 integration.** The runtime captures GLM auxiliary state, loads the
-   ModelOpt MXFP8 draft, runs compact MTP and FlashKDA prefill, and uses a
-   rowwise FP8 draft head.
-6. **Private draft KV ring.** DFlash history uses bounded request-local storage
-   instead of shared target-cache blocks. Scheduler allocation, request
-   retirement, prefix resume, block copy, zeroing, and page-table generation
-   follow the same ownership rule.
-7. **Correct shared-cache accounting.** Fixed DFlash storage is excluded from
-   shared-pool capacity calculations.
-8. **Dense MXFP8 dispatch.** B12X handles supported small batches;
-   FlashInfer Cutlass handles other shapes.
-9. **FlashKDA API repair.** The GLM caller supplies the allocated output,
-   final-state, and workspace buffers required by the pinned API.
-10. **Cache geometry repairs.** The implementation uses the packed target-cache
-    record size, sparse page-table size, and DFlash page size required by the
-    real tensors.
-11. **GB10 TopK.** Devices with less than 128 KiB shared memory per block use
-    an exact non-cooperative streaming-radix path. Existing paths remain in
-    place for other GPUs.
-12. **Source-keyed native packaging.** Native FlashInfer artifacts are tied to
-    source identity so an older cache entry cannot hide a source or ABI change.
+3. **Added the GLM serving protocol.** Packaged the official chat template from Z.ai model revision `690b705278a3a58e538fcb37c2ca8b5f9511213c`, retaining compatible reasoning, tool-call, parallel tool-result, and request-level thinking behavior.
 
-The static interface review is in
-[`docs/static-contract-review.md`](docs/static-contract-review.md). Dependency
-sources and licenses are listed in
-[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+4. **Rebuilt FlashInfer from the required source revision.** vLLM 0.29.0 already specifies FlashInfer 0.6.18, so the package version did not change. The prebuilt dependency was replaced with a source build of 0.6.18 at commit `5cc867a9bb560bc89b91dbc738a9f63f09beb89b`. That revision contains the native SM120/SM121 `GLM53_NOPE` sparse-MLA work from FlashInfer PRs #4802 and #4947.
+
+5. **Matched vLLM to the native FlashInfer ABI.** Added the `FLASHINFER_MLA_SPARSE_SM120` backend and corrected packed FP8 cache records, physical sparse page tables, K/V scales, sequence lengths, indexer state, and decode metadata for GLM's NoPE layout.
+
+6. **Corrected the target-cache format.** Selected `fp8_ds_mla` for native sparse MLA and used its real packed record size. Sliding-window layers can use their own cache format instead of inheriting the target MLA format.
+
+7. **Added a GB10-safe exact TopK implementation.** The cooperative path exceeded the shared-memory limit on devices with less than 128 KiB per block. Added an exact non-cooperative streaming-radix path, including tie and threshold handling. Existing paths remain available on other GPUs.
+
+8. **Added EXL3 to vLLM.** Implemented EXL3 configuration, tensor loading, prefill planning, logits handling, and routed expert integration.
+
+9. **Added lossless tensor-parallel checkpoint slicing.** `tools/slice_exl3_checkpoint.py` splits routed expert tensors across ranks without dequantization or requantization. It reconstructs every source tensor bit for bit before publishing the output.
+
+10. **Connected rank-sliced EXL3 to Sparkinfer.** Pinned Sparkinfer at commit `d4438d490691f79022fdfc8149e1c5f161d15445` and used its Trellis planning, scratch, binding, and execution interfaces for supported tensor-parallel shapes.
+
+11. **Built ExLlamaV3 for ARM64.** Pinned commit `c5d9c657966ffeeaa9353f0cc899f18629da4a13`. Removed optional x86 AVX translation units from the ARM64 build, added fail-closed stubs for the unavailable CPU all-reduce path, and packaged only the extension consumed by vLLM.
+
+12. **Updated CUTLASS DSL compatibility.** FlashInfer requires NVIDIA CUTLASS DSL 4.7.0. Sparkinfer's exact 4.6.0 dependency and B12X's exact 4.6.2 dependency were changed to `>=4.7.0,<5`. The final build pins 4.7.0.
+
+13. **Added B12X dense MXFP8 dispatch.** Pinned B12X 1.2.6 at commit `ab6eea89b5b5e334ac6e9f2c503c1de60c3f216c`. B12X handles supported small batches, while FlashInfer Cutlass handles other shapes. Fixed the B12X capability check so `(False, reason)` does not evaluate as supported.
+
+14. **Added DFlash2 for GLM.** Imported auxiliary target-state capture, compact MTP prefill, grouped convolutions, candidate selection, and the speculative decoding flow. The draft checkpoint uses ModelOpt MXFP8 weights and a rowwise FP8 draft head.
+
+15. **Separated target and draft cache formats.** The target cache uses packed `fp8_ds_mla`; the DFlash GQA history ring uses `fp8_e4m3`. Draft pages no longer inherit target-page padding.
+
+16. **Repaired the FlashKDA call boundary.** The pinned API requires caller-allocated output, final-state, and workspace buffers. The GLM prefill path now supplies all three. A focused test binds the caller to the pinned signature.
+
+17. **Corrected DFlash page geometry.** Used the draft tensor's actual 16-token page size instead of the larger target sparse-MLA page size.
+
+18. **Moved DFlash history into a private fixed ring.** DFlash history now uses bounded request-local storage and does not allocate shared target-pool blocks. Allocation, copy, zeroing, retirement, prefix resume, and worker page-table generation use the same ownership rule.
+
+19. **Fixed scheduler admission for the private ring.** The scheduler no longer charges shared-pool block IDs for fixed DFlash storage. This removed an admission ceiling that could leave a continuation waiting while physical KV usage remained near zero.
+
+20. **Fixed reported cache capacity.** Startup and metrics now exclude the private DFlash ring from shared-pool demand, matching the managers used for real request admission.
+
+21. **Made native packaging source-aware.** FlashInfer JIT and packaged native artifacts are keyed to source identity and ABI inputs. An older cache entry can no longer hide a source or kernel change.
+
+22. **Added complete warmup coverage.** Warmup covers the selected FlashInfer, EXL3, Sparkinfer, B12X, FlashKDA, TopK, and speculative rejection paths before CUDA graph capture.
+
+23. **Allowed shorter DFlash2 inference blocks.** A checkpoint may run fewer proposals than its trained maximum, but it may not exceed that maximum. The tested checkpoint was trained with block size 8 (seven proposals) and was also smoke-tested with block size 6 (five proposals). The target and draft weights do not change when the runtime proposal count changes.
+
+The static interface review is in [`docs/static-contract-review.md`](docs/static-contract-review.md). Source credits and licenses are in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+
+## Pinned build inputs
+
+`build/versions.env` is the machine-readable source of truth.
+
+| Component | Pinned input |
+| --- | --- |
+| vLLM source | `0.29.0`, commit `98dff2a81d747d1dba01a47f939f48c3526d4206` |
+| vLLM runtime image | `vllm/vllm-openai:v0.29.0@sha256:c2914767605584b6d8f45686b82de173ecc99e781897aa3d0a66dacd72c51ae1` |
+| CUDA build image | `nvidia/cuda:13.0.2-devel-ubuntu24.04@sha256:5dc1bca23d05bd37b011be68ec470c03b403a5da07ec3a86e41af9470e9d0cc6` |
+| vLLM CUTLASS source | `da5e086dab31d63815acafdac9a9c5893b1c69e2` |
+| FlashInfer | `0.6.18`, commit `5cc867a9bb560bc89b91dbc738a9f63f09beb89b` |
+| FlashInfer CCCL | `16bd510c9b712e82b0ab6cbb630d8e29ba1f7116` |
+| FlashInfer CUTLASS | `b46b16d003484063bca4ed365e44095c4c6ed633` |
+| FlashInfer spdlog | `c3aed4b68373955e1cc94307683d44dca1515d2b` |
+| Sparkinfer | `d4438d490691f79022fdfc8149e1c5f161d15445` |
+| ExLlamaV3 | `c5d9c657966ffeeaa9353f0cc899f18629da4a13`, format `0.0.43` |
+| B12X | `1.2.6`, commit `ab6eea89b5b5e334ac6e9f2c503c1de60c3f216c` |
+| NVIDIA CUTLASS DSL | `4.7.0` |
+| GLM chat template | Z.ai revision `690b705278a3a58e538fcb37c2ca8b5f9511213c` |
+
+External sources and wheels are downloaded during build preparation. They are not vendored here. vLLM's xgrammar requirement was not changed by this integration.
 
 ## Prepare a tensor-parallel checkpoint
 
-Inspect the planned split:
+Inspect the split plan:
 
 ```bash
 python3 tools/slice_exl3_checkpoint.py \
@@ -91,31 +98,19 @@ python3 tools/slice_exl3_checkpoint.py \
   --tp 2
 ```
 
-The output path must not exist. The tool writes to a temporary sibling,
-validates every tensor, then publishes the completed directory with one
-rename. It rejects incomplete expert records, non-MCG codebooks, unsupported
-bitrates, non-contiguous layers or experts, and dimensions that do not divide
-by the tensor-parallel size.
+The output path must not exist. The tool writes to a temporary sibling, validates every tensor, then publishes the completed directory with one rename. It rejects incomplete expert records, non-MCG codebooks, unsupported bitrates, non-contiguous layers or experts, and dimensions that do not divide by the tensor-parallel size.
 
-The qualified checkpoint used a two-way tensor-parallel split, 4-bit MCG EXL3,
-43 MoE layers, 288 experts per layer, and 92 output shards. These describe the
-tested model artifact, not fixed runner limits.
+The qualified checkpoint used a two-way tensor-parallel split, 4-bit MCG EXL3, 43 MoE layers, 288 experts per layer, and 92 output shards. These values describe the tested artifact, not runner limits.
 
 ## Build the image
 
-The build starts from the pinned official vLLM image. It compiles the changed
-vLLM CUDA extension and pinned external components, then overlays the Python
-source and native artifacts onto a fresh runtime stage. Unchanged native vLLM
-artifacts remain from the official image.
+The final image starts from the pinned official vLLM runtime. A separate CUDA development stage compiles the changed vLLM extension and pinned external components. The build overlays the Python source and required native artifacts onto a fresh runtime stage.
 
-See [`build/README.md`](build/README.md) for the reproducible build flow. Build
-inputs are pinned by digest or commit, downloaded before compilation, hashed,
-and compiled offline. The final image records source, wheel, extension, and
-toolchain provenance.
+See [`build/README.md`](build/README.md) for the reproducible build flow. The build downloads and hashes its inputs before offline compilation, then records source, wheel, extension, and toolchain provenance in the image.
 
 ## Serving configuration
 
-The qualified path uses these model-facing options:
+The tested path uses these model-facing options:
 
 ```text
 --quantization exl3
@@ -126,42 +121,45 @@ The qualified path uses these model-facing options:
 --kv-cache-dtype-skip-layers sliding_window
 --block-size 2304
 --prefix-match-unit 512
---speculative-config {"method":"dflash","model":"/path/to/dflash2","num_speculative_tokens":7}
+--speculative-config {"method":"dflash","model":"/path/to/dflash2","num_speculative_tokens":5}
 --tool-call-parser glm47
 --reasoning-parser glm45
 --enable-auto-tool-choice
 ```
 
-Set model length, sequence concurrency, batch-token limits, KV memory, network
-addresses, ports, model paths, and chat defaults for the target deployment.
-They are not hard-coded capabilities of this runner. Effective context and
-concurrency depend on checkpoint geometry, cache allocation, request mix, and
-available memory.
+Five proposals were smoke-tested with the listed drafter. Seven proposals are the checkpoint's trained maximum. Select the proposal count from measured acceptance and end-to-end throughput for the intended workload.
 
-The target cache uses packed `fp8_ds_mla`. The DFlash GQA ring uses
-`fp8_e4m3`; it does not inherit the target-cache format.
+Set model length, sequence concurrency, batch-token limits, KV memory, network addresses, ports, model paths, and chat defaults for the target deployment. Effective context and concurrency depend on checkpoint geometry, cache allocation, request mix, and available memory.
 
 ## Early measurements
 
-These results come from one two-node DGX Spark tensor-parallel deployment.
-They are initial measurements, not hardware limits or broad benchmark claims.
+These measurements come from one two-node DGX Spark deployment. They are not hardware limits or broad benchmark claims.
+
+The longer real-use sample was collected with seven proposals:
 
 | Measurement | Result |
 | --- | --- |
-| Multi-turn tool-use smoke test | 8 of 8 checks passed |
-| Smoke-test activity | 15 model turns and 17 tool calls |
-| Smoke-test token volume | 335,046 prompt tokens and 18,672 completion tokens |
-| Smoke-test wall time | 521.94 seconds |
-| Request-wall completion throughput | 36.49 completion tokens/s |
-| Baseline on the same two-node hardware | 32.25 completion tokens/s |
-| Change from baseline | +13.2% |
-| DFlash acceptance | 14,398 of 29,911 drafted tokens, 48.1% |
-| Accepted draft tokens per verification step | 3.37 |
-| Prefix-cache reuse during the smoke test | 258,048 of 335,046 prompt tokens, 77.0% |
+| Completed requests | 197 of 197, all HTTP 200 |
+| Prompt tokens | 24.35 million |
+| Generated tokens | 283,800 |
+| Weighted decode throughput | 24.5 tokens/s |
+| Previous runtime on the same hardware | 21.62 tokens/s |
+| Overall change | +13.3% |
+| Matched 40K to 100K prompts | 26.02 vs 22.65 tokens/s, +14.9% |
+| Matched 100K to 200K prompts | 24.22 vs 21.55 tokens/s, +12.4% |
+| Prefix-cache reuse | 93.6% |
+| Errors, disconnects, or capacity waits | 0 |
 
-The throughput comparison is directional because the runs produced different
-output mixes. The DFlash acceptance result applies to the tested checkpoint
-and drafter pairing.
+The five-proposal update has a bounded smoke test, not a long-run performance claim:
+
+| Measurement | Result |
+| --- | --- |
+| Draft accounting | 263 verification steps x 5 proposals = 1,315 drafts |
+| Draft positions exposed | positions 0 through 4 only |
+| Text completion | HTTP 200, normal stop, correct visible answer |
+| Code completion | HTTP 200, normal stop, correct expression |
+| Tool use | HTTP 200, valid structured tool call |
+| Runtime state | no waits, restarts, OOMs, or logged errors |
 
 ## Validation
 
@@ -170,17 +168,17 @@ Completed checks include:
 - static caller and dependency interface review for the selected path;
 - focused CPU and CUDA tests for changed cache and kernel boundaries;
 - exact GB10 TopK tests, including ties and threshold cases;
+- lossless rank-sliced checkpoint reconstruction checks;
 - full two-rank checkpoint load;
 - FlashInfer, Sparkinfer, EXL3, FlashKDA, B12X, warmup, and CUDA graph capture;
-- OpenAI-compatible API readiness and a bounded chat canary;
-- a multi-turn tool-use smoke test;
+- OpenAI-compatible chat, code, and structured tool-call requests;
+- multi-turn tool-use smoke testing;
 - continuation beyond the original scheduler-admission failure;
-- corrected private-ring capacity reporting through the startup path.
+- private-ring capacity reporting through the real startup path;
+- five-proposal DFlash2 startup, graph capture, and exact draft accounting.
 
-These checks do not establish every workload, context length, concurrency
-level, multimodal shape, or hardware revision.
+These checks do not establish every workload, context length, concurrency level, multimodal shape, or hardware revision.
 
 ## License
 
-The vLLM-derived source remains under the Apache License 2.0 in `LICENSE`.
-External dependencies and model artifacts retain their own licenses and terms.
+The vLLM-derived source remains under the Apache License 2.0 in `LICENSE`. External dependencies and model artifacts retain their own licenses and terms.

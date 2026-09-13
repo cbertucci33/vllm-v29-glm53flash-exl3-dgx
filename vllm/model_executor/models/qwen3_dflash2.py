@@ -140,13 +140,14 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
         # Query tokens per request: the bonus token plus the mask tokens.
         block_size = 1 + speculative_config.num_speculative_tokens
         trained_block_size = draft_config.get("block_size")
-        if trained_block_size is not None and int(trained_block_size) != block_size:
-            # The convolutions' block modulus is baked in at training time; a
-            # mismatch drafts silently garbage-quality tokens.
+        if trained_block_size is not None and block_size > int(trained_block_size):
+            # A checkpoint trained at a larger block size can run a shorter
+            # inference block, but it cannot draft beyond its trained depth.
             raise ValueError(
                 f"DFlash2 draft was trained with block_size {trained_block_size} "
-                f"(= num_speculative_tokens {int(trained_block_size) - 1}); got "
-                f"num_speculative_tokens {speculative_config.num_speculative_tokens}."
+                f"(maximum num_speculative_tokens "
+                f"{int(trained_block_size) - 1}); got "
+                f"{speculative_config.num_speculative_tokens}."
             )
         conv_args = dict(
             hidden_size=config.hidden_size,

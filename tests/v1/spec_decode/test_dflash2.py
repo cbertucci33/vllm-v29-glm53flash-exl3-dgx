@@ -281,6 +281,7 @@ def test_dflash2_model_decoder_layer_cls(monkeypatch):
             "selector_top_k": 3,
             "conv_kernel_size": 3,
             "conv_group_size": 2,
+            "block_size": 8,
             "use_aux_hidden_state": False,
         },
     )
@@ -290,7 +291,7 @@ def test_dflash2_model_decoder_layer_cls(monkeypatch):
                 hf_config=hf_config,
                 quantization=None,
             ),
-            num_speculative_tokens=4,
+            num_speculative_tokens=5,
             enable_adaptive_verification=False,
         ),
         model_config=SimpleNamespace(
@@ -312,6 +313,7 @@ def test_dflash2_model_decoder_layer_cls(monkeypatch):
     # 4. Assert that the layers are DFlash2Qwen3DecoderLayer (the subclass)
     assert len(model.layers) == 2
     assert isinstance(model.layers[0], DFlash2Qwen3DecoderLayer)
+    assert model.layers[0].attention_conv.block_size == 6
 
 
 def _fake_dflash_model_and_attn(weight: torch.Tensor, q_size: int, scales=None):
