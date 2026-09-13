@@ -14,7 +14,7 @@ This is the integration history from unmodified vLLM to the tested runner. The o
 
 3. **Added the GLM serving protocol.** Packaged the official chat template from Z.ai model revision `690b705278a3a58e538fcb37c2ca8b5f9511213c`, retaining compatible reasoning, tool-call, parallel tool-result, and request-level thinking behavior.
 
-4. **Rebuilt FlashInfer from the required source revision.** vLLM 0.29.0 already specifies FlashInfer 0.6.18, so the package version did not change. The prebuilt dependency was replaced with a source build of 0.6.18 at commit `5cc867a9bb560bc89b91dbc738a9f63f09beb89b`. That revision contains the native SM120/SM121 `GLM53_NOPE` sparse-MLA work from FlashInfer PRs #4802 and #4947.
+4. **Replaced prebuilt FlashInfer with the required source build.** Built FlashInfer 0.6.18 from commit `5cc867a9bb560bc89b91dbc738a9f63f09beb89b`, which contains the native SM120/SM121 `GLM53_NOPE` sparse-MLA work from FlashInfer PRs #4802 and #4947.
 
 5. **Matched vLLM to the native FlashInfer ABI.** Added the `FLASHINFER_MLA_SPARSE_SM120` backend and corrected packed FP8 cache records, physical sparse page tables, K/V scales, sequence lengths, indexer state, and decode metadata for GLM's NoPE layout.
 
@@ -52,7 +52,7 @@ This is the integration history from unmodified vLLM to the tested runner. The o
 
 22. **Added complete warmup coverage.** Warmup covers the selected FlashInfer, EXL3, Sparkinfer, B12X, FlashKDA, TopK, and speculative rejection paths before CUDA graph capture.
 
-23. **Allowed shorter DFlash2 inference blocks.** A checkpoint may run fewer proposals than its trained maximum, but it may not exceed that maximum. The tested checkpoint was trained with block size 8 (seven proposals) and was also smoke-tested with block size 6 (five proposals). The target and draft weights do not change when the runtime proposal count changes.
+23. **Allowed shorter DFlash2 inference blocks.** A checkpoint may run fewer proposals than its trained maximum, but it may not exceed that maximum. The tested checkpoint was trained with block size 8 (seven proposals) and was also smoke-tested with block size 6 (five proposals).
 
 The static interface review is in [`docs/static-contract-review.md`](docs/static-contract-review.md). Source credits and licenses are in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 
@@ -76,7 +76,7 @@ The static interface review is in [`docs/static-contract-review.md`](docs/static
 | NVIDIA CUTLASS DSL | `4.7.0` |
 | GLM chat template | Z.ai revision `690b705278a3a58e538fcb37c2ca8b5f9511213c` |
 
-External sources and wheels are downloaded during build preparation. They are not vendored here. vLLM's xgrammar requirement was not changed by this integration.
+External sources and wheels are downloaded during build preparation. They are not vendored here.
 
 ## Prepare a tensor-parallel checkpoint
 
