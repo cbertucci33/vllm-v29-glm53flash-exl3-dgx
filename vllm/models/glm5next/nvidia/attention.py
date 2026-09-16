@@ -7,11 +7,13 @@ from torch import nn
 
 from vllm.config import (
     CacheConfig,
+    CUDAGraphMode,
     VllmConfig,
 )
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -34,9 +36,21 @@ from vllm.models.glm5next.nvidia.ops.kpool_compress import fwht128_quant_fp8
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
 from vllm.utils.deep_gemm import PAGED_MQA_PAGE_SIZES
+from vllm.utils.torch_utils import aux_stream, current_stream
 from vllm.v1.kv_cache_interface import KpoolTailSpec, MLAAttentionSpec
 
 logger = init_logger(__name__)
+
+# Above this many tokens the indexer GEMMs fill the GPU on their own, so the
+# K-path / Q-path stream overlap in Indexer.forward no longer pays off.
+_DUAL_STREAM_TOKEN_THRESHOLD = 1024
+
+
+def _capturing_cudagraph() -> bool:
+    return (
+        is_forward_context_available()
+        and get_forward_context().cudagraph_runtime_mode != CUDAGraphMode.NONE
+    )
 
 # Shared torch.compile config for the indexer's small-kernel leaves. The MLA
 # indexer runs under breakable-CG (CompilationMode.NONE), which blocks FX-graph
@@ -274,6 +288,11 @@ class Indexer(nn.Module):
         self.quant_block_size = 128  # TODO: get from config
         self.topk_indices_buffer = topk_indices_buffer
         self._wp_fp32: torch.Tensor | None = None
+        self._wp_t: torch.Tensor | None = None
+        self._aux_stream = aux_stream()
+        if self._aux_stream is not None:
+            self._k_input_ready = torch.cuda.Event()
+            self._k_output_ready = torch.cuda.Event()
 
         # NOTE: (zyongye) we use fp8 naive cache,
         #       where we store value in fp8 and scale in fp32
@@ -313,16 +332,27 @@ class Indexer(nn.Module):
             tail_cache=self.tail_cache,
         )
 
-    def forward(
-        self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
-    ) -> torch.Tensor:
-        q, _ = self.wq_b(qr)
-        q = q.view(-1, self.n_head, self.head_dim)
-
-        # Compute the head gate in fp32; bf16 error can change near-tie pool
-        # rankings on long-context tasks. Cache it after weights are loaded.
+    def _project_k(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         kw, _ = self.wk_weights_proj(hidden_states)
-        k = kw[:, : self.head_dim]
+        k = _fused_indexer_k_norm(
+            kw[:, : self.head_dim],
+            self.k_norm.weight,
+            self.k_norm.bias,
+            self.head_dim,
+            self.k_norm.eps,
+        )
+        gate_score = F.linear(hidden_states, self.index_kpool_compress_gate)
+        return k, gate_score
+
+    def _head_gate(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # CUDA can accumulate directly into fp32 from the bf16 operands. Keep
+        # the original explicit-upcast path for other platforms.
+        if current_platform.is_cuda():
+            if self._wp_t is None:
+                self._wp_t = self.wk_weights_proj.weight.data[self.head_dim :].t()
+            return torch.mm(hidden_states, self._wp_t, out_dtype=torch.float32)
         if self._wp_fp32 is None:
             self._wp_fp32 = (
                 self.wk_weights_proj.weight.data[self.head_dim :, :]
@@ -330,11 +360,29 @@ class Indexer(nn.Module):
                 .contiguous()
                 .float()
             )
-        weights = torch.mm(hidden_states.float(), self._wp_fp32)
+        return torch.mm(hidden_states.float(), self._wp_fp32)
 
-        k = _fused_indexer_k_norm(
-            k, self.k_norm.weight, self.k_norm.bias, self.head_dim, self.k_norm.eps
+    def forward(
+        self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
+    ) -> torch.Tensor:
+        overlap = (
+            self._aux_stream is not None
+            and self.rope_dim == 0
+            and hidden_states.shape[0] <= _DUAL_STREAM_TOKEN_THRESHOLD
+            and _capturing_cudagraph()
         )
+        if overlap:
+            self._k_input_ready.record(current_stream())
+            with torch.cuda.stream(self._aux_stream):
+                self._k_input_ready.wait(self._aux_stream)
+                k, gate_score = self._project_k(hidden_states)
+                self._k_output_ready.record(self._aux_stream)
+        else:
+            k, gate_score = self._project_k(hidden_states)
+
+        q, _ = self.wq_b(qr)
+        q = q.view(-1, self.n_head, self.head_dim)
+        weights = self._head_gate(hidden_states)
 
         if self.rope_dim > 0:
             q_pe, q_nope = torch.split(
@@ -374,11 +422,6 @@ class Indexer(nn.Module):
             weights, q_scale, self.softmax_scale * self.n_head**-0.5
         )
 
-        # kpool: per-token gate score driving the softmax-weighted pool. Computed
-        # from the same hidden_states that produced `k`, so it stays token-aligned.
-        # F.linear(x, gate) = x @ gate.T  with gate [head_dim, hidden_size].
-        gate_score = F.linear(hidden_states, self.index_kpool_compress_gate)
-
         # DeepGEMM's MQA-logits kernels (fp8_mqa_logits /
         # fp8_fp4_paged_mqa_logits) require num_heads in {32, 64}; this
         # checkpoint uses index_n_heads=16. Zero-pad q and the per-head
@@ -388,6 +431,9 @@ class Indexer(nn.Module):
             pad = 32 - self.n_head
             q_fp8 = _pad_indexer_heads(q_fp8, pad)
             weights = _pad_indexer_heads(weights, pad)
+
+        if overlap:
+            self._k_output_ready.wait(current_stream())
 
         return self.indexer_op(
             hidden_states,
