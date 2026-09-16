@@ -82,6 +82,32 @@ External sources and wheels are downloaded during build preparation. They are no
 
 ## Prepare a tensor-parallel checkpoint
 
+### Compatibility
+
+The slicer accepts a checkpoint directory, not a Docker image. The source
+directory must contain `config.json`, `quantization_config.json`,
+`model.safetensors.index.json`, and every Safetensors shard named by the index.
+
+Supported inputs have all of these properties:
+
+- GLM-5.3 Flash routed-expert tensors use the standard
+  `layers.{L}.mlp.experts.{E}.{gate_proj|up_proj|down_proj}` names, optionally
+  below `model.` or `language_model.`;
+- EXL3 uses the MCG codebook;
+- the quantization bitrate is an integral 3, 4, 5, or 6 bits;
+- every routed expert has `trellis`, `suh`, `svh`, and `mcg` tensors for all
+  three projections;
+- MoE layer and expert IDs are contiguous; and
+- each split axis is divisible by the requested tensor-parallel size.
+
+Shard count, shard filenames, layer count, expert count, and model bitrate are
+discovered from the checkpoint. They are not fixed to the qualified model.
+
+The slicer does not support `mul1` codebooks, missing or mixed codebook markers,
+differently named expert layouts, nonintegral EXL3 bitrates, or dense-only EXL3
+checkpoints. It fails before writing the output when an input does not match
+the contract.
+
 Inspect the split plan:
 
 ```bash

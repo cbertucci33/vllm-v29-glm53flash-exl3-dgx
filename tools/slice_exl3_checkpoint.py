@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Create a tensor-parallel rank-sliced EXL3 checkpoint.
+"""Create a tensor-parallel rank-sliced MCG EXL3 checkpoint.
 
 The converter preserves the source checkpoint and writes a new sibling tree.
 Only routed-expert EXL3 tensors are transformed. Quantized Trellis payloads are
 sliced without dequantization or requantization; Hadamard vectors and codebook
 markers are sliced or replicated according to the projection's TP axis.
+
+The source must be a GLM-5.3 Flash checkpoint directory with the standard
+routed-expert tensor names, an integral 3/4/5/6 bitrate, and the MCG codebook.
+The rank-sliced runtime does not support the ``mul1`` codebook.
 """
 
 from __future__ import annotations
