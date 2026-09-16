@@ -4,6 +4,8 @@ This repository records the work required to serve a rank-sliced GLM-5.3 Flash E
 
 The runner supports GLM chat, reasoning, tools, multimodal input, hybrid KDA, native sparse MLA on GB10, EXL3 tensor parallelism, and DFlash2. It does not hard-code a context length, concurrency limit, KV-cache allocation, network address, or model path.
 
+This was originally created to run the following model: **[cbert33/GLM-5.3-Flash-Uncensored-EXL3-DGX-Sliced](https://huggingface.co/cbert33/GLM-5.3-Flash-Uncensored-EXL3-DGX-Sliced)** but any GLM 5.3 Flash EXL3 quant should work if sliced (as well as many other quants and models since it's an updated version of vLLM .29).
+
 ## How the runner was built
 
 This is the integration history from unmodified vLLM to the tested runner. The order matters because later fixes depend on cache layouts and native interfaces established earlier.
