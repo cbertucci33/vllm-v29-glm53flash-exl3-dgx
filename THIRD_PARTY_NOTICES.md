@@ -25,13 +25,18 @@ kernel. Build the runner against this exact revision or a reviewed replacement.
 
 ## Sparkinfer
 
-- Source: <https://github.com/local-inference-lab/sparkinfer>
-- Required source commit: `d4438d490691f79022fdfc8149e1c5f161d15445`
-- Relevant upstream work: PR #49
+- Source: <https://github.com/local-inference-lab/b12x>
+- Previous repository name: `local-inference-lab/sparkinfer`
+- Required source commit: [`d4438d490691f79022fdfc8149e1c5f161d15445`](https://github.com/local-inference-lab/b12x/commit/d4438d490691f79022fdfc8149e1c5f161d15445)
+- Relevant upstream work: [PR #49](https://github.com/local-inference-lab/b12x/pull/49)
 - License: Apache-2.0
 
 Rank-sliced EXL3 uses the planned Trellis interface from this revision:
 `prepare_weights`, `Caps`, `plan`, `scratch_specs`, `bind`, and `run`.
+The source is fetched during build preparation and is not vendored in this
+repository.
+This renamed repository is distinct from the dense MXFP8 B12X dependency
+listed below.
 
 ## B12X
 

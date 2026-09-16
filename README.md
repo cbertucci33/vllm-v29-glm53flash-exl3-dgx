@@ -28,7 +28,7 @@ This is the integration history from unmodified vLLM to the tested runner. The o
 
 9. **Added lossless tensor-parallel checkpoint slicing.** `tools/slice_exl3_checkpoint.py` splits routed expert tensors across ranks without dequantization or requantization. It reconstructs every source tensor bit for bit before publishing the output.
 
-10. **Connected rank-sliced EXL3 to Sparkinfer.** Pinned Sparkinfer at commit `d4438d490691f79022fdfc8149e1c5f161d15445` and used its Trellis planning, scratch, binding, and execution interfaces for supported tensor-parallel shapes.
+10. **Connected rank-sliced EXL3 to Sparkinfer.** Pinned the Sparkinfer project, now hosted as [`local-inference-lab/b12x`](https://github.com/local-inference-lab/b12x), at [commit `d4438d490691f79022fdfc8149e1c5f161d15445`](https://github.com/local-inference-lab/b12x/commit/d4438d490691f79022fdfc8149e1c5f161d15445) and used its Trellis planning, scratch, binding, and execution interfaces for supported tensor-parallel shapes. The dependency is fetched during build preparation and is not vendored in this repository.
 
 11. **Built ExLlamaV3 for ARM64.** Pinned commit `c5d9c657966ffeeaa9353f0cc899f18629da4a13`. Removed optional x86 AVX translation units from the ARM64 build, added fail-closed stubs for the unavailable CPU all-reduce path, and packaged only the extension consumed by vLLM.
 
@@ -72,9 +72,9 @@ The static interface review is in [`docs/static-contract-review.md`](docs/static
 | FlashInfer CCCL | `16bd510c9b712e82b0ab6cbb630d8e29ba1f7116` |
 | FlashInfer CUTLASS | `b46b16d003484063bca4ed365e44095c4c6ed633` |
 | FlashInfer spdlog | `c3aed4b68373955e1cc94307683d44dca1515d2b` |
-| Sparkinfer | `d4438d490691f79022fdfc8149e1c5f161d15445` |
+| Sparkinfer (now `local-inference-lab/b12x`) | [`d4438d490691f79022fdfc8149e1c5f161d15445`](https://github.com/local-inference-lab/b12x/commit/d4438d490691f79022fdfc8149e1c5f161d15445) |
 | ExLlamaV3 | `c5d9c657966ffeeaa9353f0cc899f18629da4a13`, format `0.0.43` |
-| B12X | `1.2.6`, commit `ab6eea89b5b5e334ac6e9f2c503c1de60c3f216c` |
+| B12X dense-kernel package (`lukealonso/b12x`) | `1.2.6`, commit `ab6eea89b5b5e334ac6e9f2c503c1de60c3f216c` |
 | NVIDIA CUTLASS DSL | `4.7.0` |
 | GLM chat template | Z.ai revision `690b705278a3a58e538fcb37c2ca8b5f9511213c` |
 
@@ -101,6 +101,20 @@ python3 tools/slice_exl3_checkpoint.py \
 ```
 
 The output path must not exist. The tool writes to a temporary sibling, validates every tensor, then publishes the completed directory with one rename. It rejects incomplete expert records, non-MCG codebooks, unsupported bitrates, non-contiguous layers or experts, and dimensions that do not divide by the tensor-parallel size.
+
+This conversion prepares the checkpoint for the patched rank-sliced EXL3 and
+Trellis runtime. It is not a general startup-memory optimization. The converter
+writes each rank's tensor under a rank-qualified name while retaining the
+source shard grouping, so tensors for both ranks can remain in the same
+Safetensors file. During loading, each worker discards nonlocal tensors one at
+a time. The avoidable transient allocation is therefore bounded by an
+individual already-sliced tensor, not half of the full checkpoint. The
+conversion does not halve checkpoint I/O and should not be expected to recover
+several GiB from an unrelated boot OOM.
+
+Use the converted checkpoint only with this repository's matching rank-sliced
+EXL3 loader and the tensor-parallel size recorded in its metadata. A regular
+GLM EXL3 image does not understand this format.
 
 The qualified checkpoint used a two-way tensor-parallel split, 4-bit MCG EXL3, 43 MoE layers, 288 experts per layer, and 92 output shards. These values describe the tested artifact, not runner limits.
 
