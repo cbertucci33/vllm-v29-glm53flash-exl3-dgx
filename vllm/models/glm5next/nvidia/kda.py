@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GLM-5.3-Flash KDA layer with separate convolutions and a bounded safe gate."""
 
+from dataclasses import replace
+
 import torch
 from torch import nn
 
@@ -35,12 +37,16 @@ from vllm.model_executor.utils import (
 )
 from vllm.models.kimi_k3.nvidia.kda import (
     _flashkda_prefill,
+    _store_cache_checkpoints_kernel,
     resolve_kda_prefill_backend,
 )
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
 from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
+from vllm.triton_utils import triton
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.worker.workspace import current_workspace_manager
 
 if current_platform.is_rocm():
@@ -132,6 +138,16 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
     head_dim: int
     num_heads: int
     conv_size: int
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> MambaSpec:
+        spec = super().get_kv_cache_spec(vllm_config)
+        assert isinstance(spec, MambaSpec)
+        enabled = self.kda_prefill_backend == "flashkda"
+        return replace(
+            spec,
+            num_prefill_checkpoint_blocks=int(enabled),
+            prefill_checkpoint_alignment=16 if enabled else None,
+        )
 
     def get_state_dtype(
         self,
@@ -320,6 +336,10 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                     (max_sequences, num_heads, head_dim, head_dim),
                     self.get_state_dtype()[1],
                 ),
+                (
+                    (max_sequences, num_heads, head_dim, head_dim),
+                    self.get_state_dtype()[1],
+                ),
                 ((workspace_size,), torch.uint8),
             )
 
@@ -491,6 +511,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             q_spec, k_spec, v_spec = qkv_spec.split(self.local_projection_size, dim=-1)
 
         # --- causal conv1d: non-spec path (prefill or plain decode) ---
+        raw_qkv_ns = qkv_ns
         q_ns = k_ns = v_ns = None
         if attn_metadata_narrowed.num_prefills > 0:
             assert qkv_ns is not None
@@ -576,7 +597,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             )
             if self.kda_prefill_backend == "flashkda":
                 assert self._flashkda_buffer_specs is not None
-                workspace_out, final_state, workspace = (
+                workspace_out, final_state, checkpoint_state, workspace = (
                     current_workspace_manager().get_simultaneous(
                         *self._flashkda_buffer_specs
                     )
@@ -611,7 +632,54 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                     out=flashkda_out,
                     final_state=final_state[: initial_state.shape[0]],
                     workspace=workspace,
+                    checkpoint_state=(
+                        checkpoint_state[: initial_state.shape[0]]
+                        if attn_metadata_narrowed.checkpoint is not None
+                        else None
+                    ),
+                    checkpoint_offsets=(
+                        attn_metadata_narrowed.checkpoint.checkpoint_offsets
+                        if attn_metadata_narrowed.checkpoint is not None
+                        else None
+                    ),
                 )
+                checkpoint = attn_metadata_narrowed.checkpoint
+                if checkpoint is not None:
+                    assert raw_qkv_ns is not None
+                    checkpoint_state = checkpoint_state[: initial_state.shape[0]]
+                    state_len = self.conv_size - 1
+                    width = raw_qkv_ns.shape[-1]
+                    recurrent_row_size = checkpoint_state[0].numel()
+                    block_size = 256
+                    _store_cache_checkpoints_kernel[
+                        (
+                            checkpoint.checkpoint_offsets.numel(),
+                            triton.cdiv(
+                                max(width * state_len, recurrent_row_size), block_size
+                            ),
+                        )
+                    ](
+                        raw_qkv_ns,
+                        conv_state,
+                        checkpoint_state,
+                        recurrent_state,
+                        non_spec_query_start_loc,
+                        checkpoint.checkpoint_offsets,
+                        checkpoint.state_indices,
+                        raw_qkv_ns.stride(0),
+                        raw_qkv_ns.stride(1),
+                        conv_state.stride(0),
+                        conv_state.stride(1),
+                        conv_state.stride(2),
+                        checkpoint_state.stride(0),
+                        recurrent_state.stride(0),
+                        checkpoint.checkpoint_offsets.stride(0),
+                        state_len,
+                        width,
+                        recurrent_row_size,
+                        NULL_BLOCK_ID,
+                        block_size,
+                    )
             else:
                 (
                     core_attn_out_non_spec,
