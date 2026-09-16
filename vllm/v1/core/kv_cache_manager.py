@@ -182,6 +182,9 @@ class KVCacheManager:
             for manager in self.coordinator.single_type_managers:
                 if isinstance(manager, MambaManager):
                     manager.fine_grained_prefix_cache = True
+        for manager in self.coordinator.single_type_managers:
+            if isinstance(manager, MambaManager):
+                manager.drop_eagle_checkpoint_block = self.use_eagle
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
         self.kv_cache_config = kv_cache_config

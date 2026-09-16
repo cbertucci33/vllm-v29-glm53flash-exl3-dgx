@@ -62,40 +62,6 @@ def _capturing_cudagraph() -> bool:
     )
 
 
-def _kpool_compress_insert(
-    k: torch.Tensor,
-    gate_score: torch.Tensor,
-    ape: torch.Tensor,
-    kv_cache: torch.Tensor,
-    slot_mapping: torch.Tensor,
-    kpool: int,
-    head_dim: int,
-    round_scale: bool,
-) -> None:
-    """Retain the gathered-pool writer for the older shared ROCm path."""
-    n = slot_mapping.shape[0]
-    if n < kpool:
-        return
-    pos = torch.arange(n, device=k.device)
-    valid = slot_mapping >= 0
-    write_mask = valid & (pos >= kpool - 1)
-    offs = torch.arange(kpool, device=k.device)
-    idx = (pos - (kpool - 1)).clamp_min(0)[:, None] + offs[None, :]
-    kpool_ops.kpool_compress_and_write_cache(
-        kv_cache,
-        k[idx],
-        gate_score[idx],
-        ape,
-        slot_mapping.to(torch.int64),
-        pool_size=kpool,
-        head_dim=head_dim,
-        write_mask=write_mask,
-        round_scale=round_scale,
-        write_cache=True,
-        return_compressed=False,
-    )
-
-
 def _build_decode_scatter_indices(
     decode_lens: torch.Tensor,
     num_requests: int,
@@ -381,28 +347,16 @@ def sparse_attn_indexer_kpool(
                     aux_compress = None
                     write_stream = contextlib.nullcontext()
                 with write_stream:
-                    if current_platform.is_rocm():
-                        _kpool_compress_insert(
-                            k[prefill_slice],
-                            gate_score[prefill_slice],
-                            compress_ape,
-                            kv_cache,
-                            slot_mapping[prefill_slice],
-                            index_kpool,
-                            head_dim,
-                            round_scale=(scale_fmt is not None),
-                        )
-                    else:
-                        kpool_ops.kpool_compress_tokens_and_write_cache(
-                            kv_cache,
-                            k[prefill_slice],
-                            gate_score[prefill_slice],
-                            compress_ape,
-                            slot_mapping[prefill_slice],
-                            index_kpool,
-                            head_dim,
-                            round_scale=(scale_fmt is not None),
-                        )
+                    kpool_ops.kpool_compress_tokens_and_write_cache(
+                        kv_cache,
+                        k[prefill_slice],
+                        gate_score[prefill_slice],
+                        compress_ape,
+                        slot_mapping[prefill_slice],
+                        index_kpool,
+                        head_dim,
+                        round_scale=(scale_fmt is not None),
+                    )
                     # Persist each request's incomplete prefill pool so decode
                     # can finish it, including after PD transfer. Tail slots use
                     # ``pos % kpool`` within the request's tail block. Processing

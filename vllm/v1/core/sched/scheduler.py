@@ -54,7 +54,12 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
-from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    MambaSpec,
+    get_mamba_prefill_checkpoint_position,
+    is_mamba_prefill_checkpoint_valid,
+)
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import (
     PrefixCacheStats,
@@ -338,13 +343,22 @@ class Scheduler(SchedulerInterface):
         )
         self.mamba_has_prefill_checkpoint_blocks = (
             self.has_mamba_layers
-            # TODO: support spec decoding
-            and not self.use_eagle
             and all(
                 not isinstance(group.kv_cache_spec, MambaSpec)
                 or group.kv_cache_spec.num_prefill_checkpoint_blocks > 0
                 for group in kv_cache_config.kv_cache_groups
             )
+        )
+        # GLM FlashKDA exposes one alignment for every GDN cache group.
+        # Keep the value beside the scheduler decision so a checkpoint is
+        # requested only when the backend can actually export it.
+        self.mamba_prefill_checkpoint_alignment = next(
+            (
+                group.kv_cache_spec.prefill_checkpoint_alignment
+                for group in kv_cache_config.kv_cache_groups
+                if isinstance(group.kv_cache_spec, MambaSpec)
+            ),
+            None,
         )
         eagle_groups = [
             group for group in kv_cache_config.kv_cache_groups if group.is_eagle_group
@@ -442,9 +456,21 @@ class Scheduler(SchedulerInterface):
             last_cache_position = max(last_cache_position - block_size, 0)
 
         end = start + num_new_tokens
-        use_internal_checkpoint = (
-            self.mamba_has_prefill_checkpoint_blocks and start % block_size == 0
-        )
+        use_internal_checkpoint = False
+        if self.mamba_has_prefill_checkpoint_blocks and end >= prefill_end:
+            checkpoint_position = get_mamba_prefill_checkpoint_position(
+                prefill_end,
+                self.hash_block_size,
+                drop_eagle_block=self.use_eagle_block_drop,
+            )
+            use_internal_checkpoint = is_mamba_prefill_checkpoint_valid(
+                query_start=start,
+                query_end=end,
+                checkpoint_position=checkpoint_position,
+                hash_block_size=self.hash_block_size,
+                mamba_block_size=block_size,
+                checkpoint_alignment=self.mamba_prefill_checkpoint_alignment,
+            )
         if use_internal_checkpoint:
             last_cache_position = 0
         # Invariant: slot p holds the state after exactly (p + 1) * block_size
@@ -452,7 +478,7 @@ class Scheduler(SchedulerInterface):
         # aligned. Exempt: the prompt's last chunk, whose slot decode advances
         # to the boundary. A block too wide for one chunk advances sub-block
         # and re-aligns at the next boundary.
-        if end < prefill_end and not use_internal_checkpoint:
+        if end < prefill_end:
             max_prefill_tokens = self.max_num_scheduled_tokens
             long_prefill_threshold = self.scheduler_config.long_prefill_token_threshold
             if long_prefill_threshold > 0:
@@ -464,7 +490,7 @@ class Scheduler(SchedulerInterface):
         next_block_boundary = (start // block_size + 1) * block_size
         tail_boundary = (
             request.num_prompt_tokens // self.hash_block_size * self.hash_block_size
-            if self.mamba_partial_cache_hit
+            if self.mamba_partial_cache_hit and not use_internal_checkpoint
             else 0
         )
         if tail_boundary and self.use_eagle_block_drop:

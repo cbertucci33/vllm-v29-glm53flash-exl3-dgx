@@ -238,7 +238,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         hash_block_size = self.vllm_config.cache_config.prefix_match_unit or block_size
         speculative_config = self.vllm_config.speculative_config
         drop_eagle_block = (
-            speculative_config is not None and speculative_config.use_eagle_block_drop()
+            speculative_config is not None and speculative_config.use_eagle()
         )
         checkpoint_splits: list[tuple[int, int]] = []
         checkpoint_cols: list[int] = []
