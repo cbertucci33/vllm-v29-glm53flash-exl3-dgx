@@ -288,7 +288,6 @@ class Indexer(nn.Module):
         self.quant_block_size = 128  # TODO: get from config
         self.topk_indices_buffer = topk_indices_buffer
         self._wp_fp32: torch.Tensor | None = None
-        self._wp_t: torch.Tensor | None = None
         self._aux_stream = aux_stream()
         if self._aux_stream is not None:
             self._k_input_ready = torch.cuda.Event()
@@ -347,12 +346,9 @@ class Indexer(nn.Module):
         return k, gate_score
 
     def _head_gate(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # CUDA can accumulate directly into fp32 from the bf16 operands. Keep
-        # the original explicit-upcast path for other platforms.
-        if current_platform.is_cuda():
-            if self._wp_t is None:
-                self._wp_t = self.wk_weights_proj.weight.data[self.head_dim :].t()
-            return torch.mm(hidden_states, self._wp_t, out_dtype=torch.float32)
+        # Keep both operands in fp32. FP32 accumulation of bf16 operands cannot
+        # recover the input precision lost before multiplication, and small
+        # head-gate errors can flip near-tie sparse-pool rankings at long context.
         if self._wp_fp32 is None:
             self._wp_fp32 = (
                 self.wk_weights_proj.weight.data[self.head_dim :, :]
