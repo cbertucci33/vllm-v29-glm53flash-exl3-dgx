@@ -6,6 +6,28 @@ The runner supports GLM chat, reasoning, tools, multimodal input, hybrid KDA, na
 
 This was originally created to run the following model: **[cbert33/GLM-5.3-Flash-Uncensored-EXL3-DGX-Sliced](https://huggingface.co/cbert33/GLM-5.3-Flash-Uncensored-EXL3-DGX-Sliced)** but any GLM 5.3 Flash EXL3 quant should work if sliced (as well as many other quants and models since it's an updated version of vLLM .29).
 
+## Release 2
+
+Release 2 is the first production-qualified update to the original runner. The
+runtime source ends at commit `e3c9c6943`.
+
+Changes in this release:
+
+- backported NVIDIA's K-pool scheduling work and internal KDA prefill
+  checkpoints;
+- completed the scheduler, cache-manager, and worker control path for internal
+  checkpoints;
+- restored FP32 operands for sparse-attention head gating and the stable
+  two-pass FP32 K-pool softmax;
+- preserved streamed reasoning, message, and function-call identities in the
+  final OpenAI Responses object, including tool-call IDs and message logprobs;
+- required an explicit prefix-match unit for FlashKDA checkpoints and promoted
+  checkpoint page addressing to int64; and
+- qualified DFlash2 with seven proposals on the two-node DGX Spark deployment.
+
+The release retains the original runner's GLM, EXL3, sparse MLA, B12X,
+FlashKDA, tool-use, reasoning, and multimodal paths.
+
 ## How the runner was built
 
 This is the integration history from unmodified vLLM to the tested runner. The order matters because later fixes depend on cache layouts and native interfaces established earlier.
@@ -163,13 +185,15 @@ The tested path uses these model-facing options:
 --kv-cache-dtype-skip-layers sliding_window
 --block-size 2304
 --prefix-match-unit 512
---speculative-config {"method":"dflash","model":"/path/to/dflash2","num_speculative_tokens":5}
+--speculative-config {"method":"dflash","model":"/path/to/dflash2","num_speculative_tokens":7}
 --tool-call-parser glm47
 --reasoning-parser glm45
 --enable-auto-tool-choice
 ```
 
-Five proposals were smoke-tested with the listed drafter. Seven proposals are the checkpoint's trained maximum. Select the proposal count from measured acceptance and end-to-end throughput for the intended workload.
+Release 2 was qualified with seven proposals, the checkpoint's trained
+maximum. Five proposals were also smoke-tested. Select the proposal count from
+measured acceptance and end-to-end throughput for the intended workload.
 
 Set model length, sequence concurrency, batch-token limits, KV memory, network addresses, ports, model paths, and chat defaults for the target deployment. Effective context and concurrency depend on checkpoint geometry, cache allocation, request mix, and available memory.
 
@@ -177,7 +201,38 @@ Set model length, sequence concurrency, batch-token limits, KV memory, network a
 
 These measurements come from one two-node DGX Spark deployment. They are not hardware limits or broad benchmark claims.
 
-The longer real-use sample was collected with seven proposals:
+### Release 2 initial production sample
+
+This sample covers 286 completed requests from a real OpenClaw tool workload.
+The deployment used tensor parallelism across two DGX Spark systems, seven
+DFlash proposals, an 800,000-token model limit, three sequence slots, a
+16,384-token batch budget, and 10.2 GB of KV-cache memory per rank.
+
+| Measurement | Result |
+| --- | --- |
+| Completed requests | 286 of 286, all HTTP 200 |
+| Errors or aborts | 0 |
+| Prompt tokens | 35,276,415 |
+| Generated tokens | 94,321 |
+| Prefix-cache reuse | 96.1% |
+| Weighted decode throughput | 29.0 tokens/s |
+| Mean time to first token | 3.45 s |
+| Mean prefill time | 3.28 s |
+| Mean decode time | 11.38 s |
+| Mean end-to-end request time | 14.83 s |
+| Overall draft-token acceptance | 29.5% |
+| Useful tokens per verification step | 3.06 |
+| Draft acceptance by position, 1 through 7 | 68.3%, 46.6%, 32.2%, 22.4%, 16.3%, 12.0%, 8.8% |
+| Requests reaching first token within 5 s | 96.5% |
+| Requests completing within 20 s | 80.8% |
+
+These are initial operational results, not a controlled benchmark. Prompt
+length, output length, cache warmth, reasoning depth, and concurrency varied
+across the sample.
+
+### Earlier seven-proposal baseline
+
+The earlier real-use sample was also collected with seven proposals:
 
 | Measurement | Result |
 | --- | --- |
