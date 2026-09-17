@@ -143,6 +143,12 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         spec = super().get_kv_cache_spec(vllm_config)
         assert isinstance(spec, MambaSpec)
         enabled = self.kda_prefill_backend == "flashkda"
+        if enabled and vllm_config.cache_config.prefix_match_unit is None:
+            raise ValueError(
+                "FlashKDA internal prefill checkpoints require an explicit "
+                "prefix_match_unit so the scheduler and worker use the same "
+                "checkpoint boundary."
+            )
         return replace(
             spec,
             num_prefill_checkpoint_blocks=int(enabled),
