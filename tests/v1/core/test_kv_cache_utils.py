@@ -2505,7 +2505,6 @@ def test_get_kv_cache_config_balanced_mamba_hybrid():
     ) == pytest.approx(100 / blocks_per_request)
 
 
-@_GLM5_PORT_LAYOUT_SKIP
 def test_get_kv_cache_config_kpool_tail_coowns_indexer_tensor():
     """The kpool tail parasitizes the indexer tensors instead of getting its
     own: sibling idx/tail tensors paired by layer order, zero standalone tail
@@ -2579,7 +2578,6 @@ def test_get_kv_cache_config_kpool_tail_coowns_indexer_tensor():
     )
 
 
-@_GLM5_PORT_LAYOUT_SKIP
 def test_glm5_kpool_tail_does_not_drag_hash_block_size():
     """The tail's kpool-sized scratch block (4 tokens) must not constrain the
     prefix-cache hash granularity: participating groups alone decide it."""
