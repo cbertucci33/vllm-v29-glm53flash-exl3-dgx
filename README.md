@@ -4,7 +4,134 @@ This repository records the work required to serve a rank-sliced GLM-5.3 Flash E
 
 The runner supports GLM chat, reasoning, tools, multimodal input, hybrid KDA, native sparse MLA on GB10, EXL3 tensor parallelism, and DFlash2. It does not hard-code a context length, concurrency limit, KV-cache allocation, network address, or model path.
 
-This was originally created to run the following model: **[cbert33/GLM-5.3-Flash-Uncensored-EXL3-DGX-Sliced](https://huggingface.co/cbert33/GLM-5.3-Flash-Uncensored-EXL3-DGX-Sliced)** but any GLM 5.3 Flash EXL3 quant should work if sliced (as well as many other quants and models since it's an updated version of vLLM .29).
+The qualified model is
+**[cbert33/GLM-5.3-Flash-Uncensored-EXL3-DGX-Sliced](https://huggingface.co/cbert33/GLM-5.3-Flash-Uncensored-EXL3-DGX-Sliced)**.
+Other GLM-5.3 Flash EXL3 checkpoints must satisfy the slicer compatibility
+contract documented below.
+
+## Basic deployment
+
+The qualified deployment uses two NVIDIA DGX Spark systems with tensor
+parallelism across the ConnectX fabric. Both ranks must use the same image,
+source revision, rank-sliced checkpoint, DFlash checkpoint, and runtime flags.
+
+1. Check out the release and prepare the pinned build inputs:
+
+   ```bash
+   git checkout v3.0.0
+   ```
+
+   Follow [`build/README.md`](build/README.md) to verify the pinned sources,
+   build the native artifacts, and create the final image context.
+
+2. Inspect and create a two-way rank-sliced checkpoint:
+
+   ```bash
+   python3 tools/slice_exl3_checkpoint.py \
+     /path/to/source-checkpoint \
+     --tp 2 \
+     --plan
+
+   python3 tools/slice_exl3_checkpoint.py \
+     /path/to/source-checkpoint \
+     /path/to/rank-sliced-checkpoint \
+     --tp 2
+   ```
+
+3. Transfer the exact built image to the peer node. Start rank 1 in headless
+   mode before rank 0. The tested container contract uses host networking and
+   IPC, `/dev/infiniband`, `IPC_LOCK`, unlimited memlock, and a RoCE GID index
+   discovered from the current host after boot. Do not hard-code a stale GID
+   index.
+
+4. Launch with the model-facing options in [Serving configuration](#serving-configuration).
+   Verify `/v1/models`, both ranks, the selected NVIDIA backends, and one cold
+   plus one cached-prefix request. Treat a fallback backend, missing native
+   symbol, rank error, or cache-layout warning as a failed deployment.
+
+## Current performance
+
+These results come from one two-node DGX Spark deployment. They are operational
+measurements, not hardware limits or broad benchmark claims.
+
+### Release 3 cached-prefix acceptance
+
+The final Release 3 image was accepted through the production telemetry path
+with DFlash2 configured for seven proposals and a 971,162-token cache.
+
+| Request | Input tokens | Cached tokens | Output | Time |
+| --- | ---: | ---: | --- | ---: |
+| Cold prefix | 33,822 | 0 | exact `WARM_PREFIX_OK` | 19.603 s |
+| Shared-prefix continuation | 33,828 | 27,648 | exact `CACHED_CONTINUATION_OK` | 3.553 s |
+
+Both requests returned HTTP 200. Both ranks remained up with zero restarts or
+post-start errors. The accepted runtime source ends at commit `73c0212232`.
+
+### Latest extended production sample
+
+The latest substantial production sample is a 286-request Release 2 tool
+workload. Release 3 has passed focused corruption regressions and the
+cached-prefix acceptance above, but it has not yet accumulated a comparable
+long-run sample.
+
+| Measurement | Result |
+| --- | --- |
+| Completed requests | 286 of 286, all HTTP 200 |
+| Errors or aborts | 0 |
+| Prompt tokens | 35,276,415 |
+| Generated tokens | 94,321 |
+| Prefix-cache reuse | 96.1% |
+| Weighted decode throughput | 29.0 tokens/s |
+| Mean time to first token | 3.45 s |
+| Mean prefill time | 3.28 s |
+| Mean decode time | 11.38 s |
+| Mean end-to-end request time | 14.83 s |
+| Overall draft-token acceptance | 29.5% |
+| Useful tokens per verification step | 3.06 |
+| Draft acceptance by position, 1 through 7 | 68.3%, 46.6%, 32.2%, 22.4%, 16.3%, 12.0%, 8.8% |
+| Requests reaching first token within 5 s | 96.5% |
+| Requests completing within 20 s | 80.8% |
+
+The production sample used an 800,000-token model limit, three sequence slots,
+a 16,384-token batch budget, and 10.2 GB of KV-cache memory per rank. Prompt
+length, output length, cache warmth, reasoning depth, and concurrency varied.
+
+## Release 3
+
+Release 3 is an NVIDIA-focused cache-correctness update. It fixes the persistent
+prefix corruption and speculative-boundary defects found during long-lived GLM
+tool workloads. The runtime source ends at commit `73c0212232`.
+
+Changes in this release:
+
+- backported [vLLM #57477](https://github.com/vllm-project/vllm/pull/57477)
+  so the NVIDIA GLM K-pool seed kernel addresses tail blocks with the padded
+  indexer-page stride instead of overwriting unrelated cached pages;
+- backported [vLLM #56196](https://github.com/vllm-project/vllm/pull/56196)
+  so one-token and two-token prefill chunks write convolution state to their
+  own current block rather than a shared prefix block;
+- applied the DFlash and DSpark semantics from
+  [vLLM #54163](https://github.com/vllm-project/vllm/pull/54163): separate
+  draft KV no longer causes EAGLE-style target-tail drops;
+- carried that precise target-tail capability through the scheduler, local
+  cache manager, shared GDN metadata, Kimi K3 FlashKDA metadata, CPU offload,
+  Mooncake storage, and generic KV offload paths;
+- adapted the NVIDIA portions of
+  [vLLM #55219](https://github.com/vllm-project/vllm/pull/55219) and
+  [vLLM #56059](https://github.com/vllm-project/vllm/pull/56059) so the K-pool
+  tail ring covers the full speculative window and fails safely on an invalid
+  physical block;
+- adapted [vLLM #57605](https://github.com/vllm-project/vllm/pull/57605) so
+  Mamba lookahead allocation, estimation, null padding, and checkpoint identity
+  use the same main-model boundary without double-counting a page; and
+- retained the specialized NVIDIA GLM aliased tail layout and made invalid
+  geometry fail closed. No generic fallback and no AMD-path changes were added.
+
+Focused verification covered the repaired K-pool stride, short-chunk
+convolution ownership, DFlash target-tail behavior, Kimi checkpoint placement,
+speculative tail capacity, physical-block bounds, and Mamba allocation and
+checkpoint boundaries. Eight focused NVIDIA GPU regressions and two specialized
+layout tests passed before the final two-rank acceptance.
 
 ## Release 2
 
@@ -28,9 +155,11 @@ Changes in this release:
 The release retains the original runner's GLM, EXL3, sparse MLA, B12X,
 FlashKDA, tool-use, reasoning, and multimodal paths.
 
-## How the runner was built
+## Release 1
 
-This is the integration history from unmodified vLLM to the tested runner. The order matters because later fixes depend on cache layouts and native interfaces established earlier.
+Release 1 is the original vLLM 0.29 integration. It introduced the following
+23 changes. The order matters because later fixes depend on cache layouts and
+native interfaces established earlier.
 
 1. **Started from vLLM 0.29.0.** The source base is tag `v0.29.0`, commit `98dff2a81d747d1dba01a47f939f48c3526d4206`. The runtime starts from the official `vllm/vllm-openai:v0.29.0` image pinned by digest.
 
@@ -197,38 +326,9 @@ measured acceptance and end-to-end throughput for the intended workload.
 
 Set model length, sequence concurrency, batch-token limits, KV memory, network addresses, ports, model paths, and chat defaults for the target deployment. Effective context and concurrency depend on checkpoint geometry, cache allocation, request mix, and available memory.
 
-## Early measurements
+## Historical measurements
 
 These measurements come from one two-node DGX Spark deployment. They are not hardware limits or broad benchmark claims.
-
-### Release 2 initial production sample
-
-This sample covers 286 completed requests from a real OpenClaw tool workload.
-The deployment used tensor parallelism across two DGX Spark systems, seven
-DFlash proposals, an 800,000-token model limit, three sequence slots, a
-16,384-token batch budget, and 10.2 GB of KV-cache memory per rank.
-
-| Measurement | Result |
-| --- | --- |
-| Completed requests | 286 of 286, all HTTP 200 |
-| Errors or aborts | 0 |
-| Prompt tokens | 35,276,415 |
-| Generated tokens | 94,321 |
-| Prefix-cache reuse | 96.1% |
-| Weighted decode throughput | 29.0 tokens/s |
-| Mean time to first token | 3.45 s |
-| Mean prefill time | 3.28 s |
-| Mean decode time | 11.38 s |
-| Mean end-to-end request time | 14.83 s |
-| Overall draft-token acceptance | 29.5% |
-| Useful tokens per verification step | 3.06 |
-| Draft acceptance by position, 1 through 7 | 68.3%, 46.6%, 32.2%, 22.4%, 16.3%, 12.0%, 8.8% |
-| Requests reaching first token within 5 s | 96.5% |
-| Requests completing within 20 s | 80.8% |
-
-These are initial operational results, not a controlled benchmark. Prompt
-length, output length, cache warmth, reasoning depth, and concurrency varied
-across the sample.
 
 ### Earlier seven-proposal baseline
 
