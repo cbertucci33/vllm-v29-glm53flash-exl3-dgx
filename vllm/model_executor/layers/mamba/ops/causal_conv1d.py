@@ -202,6 +202,16 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
 
         # STEP 2:
         # here prepare data for updating conv_state
+        # The updated state belongs to the block of the last scheduled token,
+        # which differs from the shared prefix block used as the initial state.
+        conv_states_output_coord = tl.load(
+            conv_state_indices_ptr + idx_seq * stride_cache_indices + current_last_index
+        ).to(tl.int64)
+        conv_states_out_base = (
+            conv_states_ptr
+            + (conv_states_output_coord * stride_conv_state_seq)
+            + (idx_feats * stride_conv_state_dim)
+        )  # [BLOCK_N,]
         if (
             state_len <= seqlen
         ):  # SMALL_CACHE=True (only move part of 'x' into conv_state cache)
@@ -224,20 +234,10 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
             loaded_x = tl.load(x_ptrs, mask_x, 0.0)
             idx_tokens_conv = tl.arange(0, NP2_STATELEN)  # [BLOCK_M]
 
-            # Compute the offset where the last block should be written in the conv_states
-            conv_states_output_coord = tl.load(
-                conv_state_indices_ptr
-                + idx_seq * stride_cache_indices
-                + current_last_index
-            ).to(tl.int64)
-
             conv_states_ptrs_target = (
-                conv_states_ptr
-                + (conv_states_output_coord * stride_conv_state_seq)  # Offset from seq
-                + (idx_feats * stride_conv_state_dim)
-            )[None, :] + (  # [BLOCK_N,]
-                idx_tokens_conv * stride_conv_state_tok
-            )[:, None]
+                conv_states_out_base
+                + (idx_tokens_conv * stride_conv_state_tok)[:, None]
+            )  # [BLOCK_M, BLOCK_N]
 
             mask = (idx_tokens_conv < state_len)[:, None] & (idx_feats < dim)[None, :]
             tl.debug_barrier()  #  NOTE: use this due to bug in Triton compiler
@@ -280,7 +280,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
                     mask, conv_state, loaded_x
                 )  # BUG in 'tl.where'  which requires a barrier before this
                 conv_states_ptrs_target = (
-                    conv_states_base
+                    conv_states_out_base
                     + (idx_tokens_conv * stride_conv_state_tok)[:, None]
                 )  # [BLOCK_M, BLOCK_N]
                 mask = (idx_tokens_conv < state_len)[:, None] & (idx_feats < dim)[
@@ -307,7 +307,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
                 new_conv_state = tl.load(x_ptrs, mask_x, 0.0)
 
                 conv_states_ptrs_target = (
-                    conv_states_base
+                    conv_states_out_base
                     + (idx_tokens_conv * stride_conv_state_tok)[:, None]
                 )  # [BLOCK_M, BLOCK_N]
                 mask = (idx_tokens_conv < state_len)[:, None] & (idx_feats < dim)[

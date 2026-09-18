@@ -285,12 +285,13 @@ class Scheduler(SchedulerInterface):
                     else 1
                 )
 
-        # The resume-checkpoint path keys its tail-boundary adjustment on the
-        # block-drop behavior, not merely on speculative decoding. This branch
-        # retains v0.29's legacy contract where every EAGLE-family method drops
-        # the trailing matched block; keep the bit explicit so the scheduler
-        # and cache manager cannot diverge and the non-EAGLE path is defined.
-        self.use_eagle_block_drop = self.use_eagle
+        # DFlash/DSpark draft from their own KV cache and do not pollute the
+        # target's trailing cache block. Only EAGLE/EAGLE3/MTP require a drop.
+        self.use_eagle_block_drop = (
+            speculative_config.use_eagle_block_drop()
+            if speculative_config is not None
+            else False
+        )
 
         # Create the KV cache manager.
         if hash_block_size is None:
@@ -452,7 +453,9 @@ class Scheduler(SchedulerInterface):
         # Eagle, FullAttn prunes the last matching block, so back off one
         # block to avoid a Mamba cache miss.
         last_cache_position = request.num_tokens - request.num_tokens % block_size
-        if self.use_eagle and not getattr(self, "mamba_eagle_skip_backoff", False):
+        if self.use_eagle_block_drop and not getattr(
+            self, "mamba_eagle_skip_backoff", False
+        ):
             last_cache_position = max(last_cache_position - block_size, 0)
 
         end = start + num_new_tokens

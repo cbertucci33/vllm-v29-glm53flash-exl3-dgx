@@ -89,6 +89,7 @@ def _split(
     stub = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=MAMBA_BLOCK_SIZE),
         use_eagle=use_eagle,
+        use_eagle_block_drop=use_eagle and not dflash_skip_backoff,
         max_num_scheduled_tokens=16384,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
         # `prefix_match_unit` finer than the block size (#46384).
@@ -135,6 +136,20 @@ def test_internal_checkpoint_split(
 def test_dflash_noncacheable_draft_keeps_last_mamba_boundary() -> None:
     (request,) = create_requests(1, num_tokens=3602, block_size=ATTN_BLOCK_SIZE)
     assert _split(request, 3602, dflash_skip_backoff=True) == 2 * MAMBA_BLOCK_SIZE
+
+
+def test_dflash_does_not_shift_partial_tail_boundary() -> None:
+    """DFlash owns its draft KV and must not use EAGLE's target-KV drop."""
+    (request,) = create_requests(1, num_tokens=PROMPT_LEN, block_size=ATTN_BLOCK_SIZE)
+    without_drop = _split(
+        request,
+        PROMPT_LEN,
+        partial_hit=True,
+        dflash_skip_backoff=True,
+    )
+    with_drop = _split(request, PROMPT_LEN, partial_hit=True)
+    assert without_drop == MAMBA_BLOCK_SIZE
+    assert with_drop == MAMBA_BLOCK_SIZE - ATTN_BLOCK_SIZE
 
 
 def _run_chunked_prefill(

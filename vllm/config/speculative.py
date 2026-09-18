@@ -1853,6 +1853,10 @@ class SpeculativeConfig:
         # TODO(ben): Refactor this so the naming is clearer
         return self.method in ("eagle", "eagle3", "mtp", "dflash", "dspark")
 
+    def use_eagle_block_drop(self) -> bool:
+        """Whether the drafter can pollute the target's trailing KV block."""
+        return self.method in ("eagle", "eagle3", "mtp")
+
     def use_dflash(self) -> bool:
         return self.method == "dflash"
 

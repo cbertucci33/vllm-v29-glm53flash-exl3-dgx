@@ -392,3 +392,108 @@ def test_causal_conv1d_varlen(
     )
     unpadded_out = out[:, : out_ref_tensor.shape[-1]]
     assert torch.allclose(unpadded_out, out_ref_tensor, rtol=rtol, atol=atol)
+
+
+def _apc_prefill_chunk(
+    x_chunk,
+    weight,
+    bias,
+    conv_states,
+    cache_indices,
+    initial_state_idx,
+    block_idx_last,
+    num_computed_tokens,
+    block_size,
+    has_initial_state,
+):
+    device = conv_states.device
+    i32 = {"dtype": torch.int32, "device": device}
+    return causal_conv1d_fn(
+        x_chunk,
+        weight,
+        bias,
+        conv_states=conv_states,
+        query_start_loc=torch.tensor([0, x_chunk.shape[-1]], **i32),
+        cache_indices=torch.tensor([cache_indices], **i32),
+        has_initial_state=torch.tensor([has_initial_state], device=device),
+        activation="silu",
+        block_idx_first_scheduled_token=torch.tensor([block_idx_last], **i32),
+        block_idx_last_scheduled_token=torch.tensor([block_idx_last], **i32),
+        initial_state_idx=torch.tensor([initial_state_idx], **i32),
+        num_computed_tokens=torch.tensor([num_computed_tokens], **i32),
+        block_size_to_align=block_size,
+    )
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike(),
+    reason="the prefix-caching conv-state path is exercised on CUDA-alike only",
+)
+@pytest.mark.parametrize("dim", [64, 4096])
+def test_causal_conv1d_apc_short_chunk_writes_last_scheduled_block(dim):
+    """A short chunk must write its own block, not the shared prefix block."""
+    device = DEVICE
+    set_random_seed(0)
+    width = 4
+    state_len = width - 1
+    block_size = 16
+    prefix_block, own_block, next_block = 1, 2, 3
+    dtype = torch.float32
+
+    weight = torch.randn(dim, width, device=device, dtype=dtype)
+    bias = torch.randn(dim, device=device, dtype=dtype)
+    initial_state = torch.randn(dim, state_len, device=device, dtype=dtype)
+    x = torch.randn(5, dim, device=device, dtype=dtype).T.contiguous()
+
+    def fresh_states():
+        states = torch.zeros(4, dim, state_len, device=device, dtype=dtype)
+        states[prefix_block] = initial_state
+        return states
+
+    ref_states = fresh_states()
+    out_ref = _apc_prefill_chunk(
+        x,
+        weight,
+        bias,
+        ref_states,
+        [prefix_block, next_block],
+        0,
+        1,
+        block_size,
+        block_size,
+        True,
+    )
+
+    states = fresh_states()
+    states[own_block] = float("nan")
+    out_a = _apc_prefill_chunk(
+        x[:, :2],
+        weight,
+        bias,
+        states,
+        [prefix_block, own_block],
+        0,
+        1,
+        block_size,
+        block_size,
+        True,
+    )
+    assert torch.equal(states[prefix_block], initial_state)
+    expected_own = torch.cat([initial_state[:, 2:], x[:, :2]], dim=-1)
+    assert torch.allclose(states[own_block], expected_own)
+    assert torch.allclose(out_a, out_ref[:, :2], rtol=1e-4, atol=1e-4)
+
+    out_b = _apc_prefill_chunk(
+        x[:, 2:],
+        weight,
+        bias,
+        states,
+        [own_block, next_block],
+        0,
+        1,
+        block_size + 2,
+        block_size,
+        True,
+    )
+    assert torch.isfinite(out_b).all()
+    assert torch.allclose(out_b, out_ref[:, 2:], rtol=1e-4, atol=1e-4)
