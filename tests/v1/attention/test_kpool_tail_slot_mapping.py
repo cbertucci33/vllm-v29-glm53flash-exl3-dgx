@@ -23,14 +23,13 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-
+from vllm.models.glm5next.nvidia.attention import Glm5NextTailCache
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.mla.indexer import (
     KpoolTailBackend,
     KpoolTailMetadataBuilder,
     compute_kpool_tail_slot_mapping,
 )
-from vllm.models.glm5next.nvidia.attention import Glm5NextTailCache
 from vllm.v1.kv_cache_interface import KpoolTailSpec, compute_layout_strides
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
