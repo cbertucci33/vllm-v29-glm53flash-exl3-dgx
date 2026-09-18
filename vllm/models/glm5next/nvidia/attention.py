@@ -36,6 +36,7 @@ from vllm.models.glm5next.nvidia.ops.kpool_compress import fwht128_quant_fp8
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
 from vllm.utils.deep_gemm import PAGED_MQA_PAGE_SIZES
+from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import aux_stream, current_stream
 from vllm.v1.kv_cache_interface import KpoolTailSpec, MLAAttentionSpec
 
@@ -173,9 +174,9 @@ class Glm5NextIndexerCache(DeepseekV32IndexerCache):
 class Glm5NextTailCache(DeepseekV32IndexerCache):
     """Paged circular buffer for the kpool indexer's in-progress (tail) pool.
 
-    Holds the trailing incomplete pool's raw K + gate score: one block of
-    ``index_kpool`` slots per request, overwritten in place by ``pos % kpool``
-    as decode/spec-decode advances. Prefill seeds it (instead of discarding the
+    Holds the trailing incomplete pool's raw K + gate score in a one-block
+    circular ring large enough for the open pool plus one speculative step.
+    Prefill seeds it (instead of discarding the
     tail raw K+gate); the connector transfers it across PD; decode reads it to
     compress the boundary pool correctly. ``KpoolTailSpec`` /
     ``KpoolTailManager`` provide the no-prune, 1-block/req allocation that lets
@@ -204,13 +205,26 @@ class Glm5NextTailCache(DeepseekV32IndexerCache):
     def get_kv_cache_spec(self, vllm_config: VllmConfig):
         # The two head slots form [K, gate score] in the generic
         # [block, head, state, content] cache view.
+        span = self._index_kpool + vllm_config.num_speculative_tokens
+        capacity = self._index_kpool * cdiv(span, self._index_kpool)
+        indexer_states = self.cache_config.block_size // self._index_kpool
+        indexer_page_bytes = indexer_states * (self.head_dim + 4)
+        tail_page_bytes = 2 * capacity * self.head_dim * torch.bfloat16.itemsize
+        if tail_page_bytes > indexer_page_bytes:
+            raise ValueError(
+                "GLM K-pool speculative tail ring does not fit its aliased "
+                "indexer page: "
+                f"capacity={capacity}, tail_bytes={tail_page_bytes}, "
+                f"indexer_bytes={indexer_page_bytes}. Refusing a generic "
+                "cache-layout fallback."
+            )
         return KpoolTailSpec(
-            block_size=self._index_kpool,
+            block_size=capacity,
             num_kv_heads=2,
             head_size=self.head_dim,
             head_size_v=0,
             dtype=torch.bfloat16,
-            sliding_window=self._index_kpool,
+            sliding_window=capacity,
         )
 
     def get_attn_backend(self):

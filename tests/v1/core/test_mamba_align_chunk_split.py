@@ -63,6 +63,9 @@ def _make_hybrid_kv_cache_manager(
                     mamba_cache_mode="align",
                     num_speculative_blocks=NUM_SPEC,
                     num_prefill_checkpoint_blocks=num_prefill_checkpoint_blocks,
+                    prefill_checkpoint_alignment=(
+                        16 if num_prefill_checkpoint_blocks else None
+                    ),
                 ),
             ),
         ],
@@ -151,6 +154,87 @@ def test_dflash_does_not_shift_partial_tail_boundary() -> None:
     assert without_drop == MAMBA_BLOCK_SIZE
     expected_eagle_tail = PROMPT_LEN // ATTN_BLOCK_SIZE * ATTN_BLOCK_SIZE
     assert with_drop == expected_eagle_tail - ATTN_BLOCK_SIZE
+
+
+@pytest.mark.parametrize(
+    ("main_tokens", "expected_blocks"),
+    [
+        (MAMBA_BLOCK_SIZE - 1, 1 + NUM_SPEC),
+        (MAMBA_BLOCK_SIZE, 2 + NUM_SPEC),
+    ],
+)
+def test_align_lookahead_materializes_exactly_one_boundary_page(
+    main_tokens: int, expected_blocks: int
+) -> None:
+    """Estimator and allocator agree, and only a page boundary gains a page."""
+    manager = _make_hybrid_kv_cache_manager()
+    mamba_manager = manager.coordinator.single_type_managers[MAMBA_GROUP_ID]
+    req_id = f"lookahead-{main_tokens}"
+    tokens_with_lookahead = main_tokens + 1
+
+    estimated = mamba_manager.get_num_blocks_to_allocate(
+        req_id,
+        tokens_with_lookahead,
+        [],
+        total_computed_tokens=0,
+        num_local_computed_tokens=0,
+        num_tokens_main_model=main_tokens,
+    )
+    allocated = mamba_manager.allocate_new_blocks(
+        req_id, tokens_with_lookahead, main_tokens
+    )
+
+    assert estimated == expected_blocks
+    assert len(allocated) == estimated
+    assert len(mamba_manager.req_to_blocks[req_id]) == expected_blocks
+    assert all(not block.is_null for block in mamba_manager.req_to_blocks[req_id])
+
+
+def test_align_running_request_estimates_one_page_at_next_boundary() -> None:
+    manager = _make_hybrid_kv_cache_manager()
+    mamba_manager = manager.coordinator.single_type_managers[MAMBA_GROUP_ID]
+    req_id = "lookahead-running"
+
+    first = mamba_manager.allocate_new_blocks(
+        req_id, MAMBA_BLOCK_SIZE + 1, MAMBA_BLOCK_SIZE
+    )
+    assert len(first) == 2 + NUM_SPEC
+
+    main_tokens = 2 * MAMBA_BLOCK_SIZE
+    estimated = mamba_manager.get_num_blocks_to_allocate(
+        req_id,
+        main_tokens + 1,
+        [],
+        total_computed_tokens=MAMBA_BLOCK_SIZE,
+        num_local_computed_tokens=MAMBA_BLOCK_SIZE,
+        num_tokens_main_model=main_tokens,
+    )
+    allocated = mamba_manager.allocate_new_blocks(
+        req_id, main_tokens + 1, main_tokens
+    )
+
+    assert estimated == 1
+    assert len(allocated) == estimated
+
+
+def test_align_lookahead_does_not_move_internal_checkpoint() -> None:
+    main_tokens = 3 * MAMBA_BLOCK_SIZE
+
+    def checkpoint_for(num_tokens: int) -> tuple[int, int]:
+        manager = _make_hybrid_kv_cache_manager(num_prefill_checkpoint_blocks=1)
+        mamba_manager = manager.coordinator.single_type_managers[MAMBA_GROUP_ID]
+        req_id = f"checkpoint-{num_tokens}"
+        mamba_manager.get_num_blocks_to_allocate(
+            req_id,
+            num_tokens,
+            [],
+            total_computed_tokens=MAMBA_BLOCK_SIZE,
+            num_local_computed_tokens=MAMBA_BLOCK_SIZE,
+            num_tokens_main_model=main_tokens,
+        )
+        return mamba_manager._checkpoints[req_id]
+
+    assert checkpoint_for(main_tokens + 1) == checkpoint_for(main_tokens)
 
 
 def _run_chunked_prefill(

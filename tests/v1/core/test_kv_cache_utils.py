@@ -2230,7 +2230,7 @@ def _glm5_like_kv_cache_spec(
 def _glm5_like_kv_cache_spec_with_tail(
     mamba_spec_factory=new_mamba_spec,
 ) -> dict[str, KVCacheSpec]:
-    """Production kpool=4 proportions: (mamba*3, MLA + indexer + tail) * 11.
+    """Production kpool=4 proportions with a two-pool speculative tail ring.
 
     The tail's logical page (2 * kpool * 2*indexer_head_dim * bf16) must fit
     inside the indexer page it parasitizes (block_size//kpool * 132 B), which
@@ -2243,13 +2243,14 @@ def _glm5_like_kv_cache_spec_with_tail(
             cast(MLAAttentionSpec, kv_cache_spec[f"layers.{i}.indexer"]),
             tokens_per_state=kpool,
         )
+        ring = 2 * kpool
         kv_cache_spec[f"layers.{i}.tail"] = KpoolTailSpec(
-            block_size=kpool,
+            block_size=ring,
             num_kv_heads=2,
             head_size=128,
             head_size_v=0,
             dtype=torch.bfloat16,
-            sliding_window=kpool,
+            sliding_window=ring,
         )
     return kv_cache_spec
 

@@ -359,7 +359,7 @@ def sparse_attn_indexer_kpool(
                     )
                     # Persist each request's incomplete prefill pool so decode
                     # can finish it, including after PD transfer. Tail slots use
-                    # ``pos % kpool`` within the request's tail block. Processing
+                    # ``pos % ring`` within the request's tail block. Processing
                     # only the batch's trailing tokens would miss all but the last
                     # request in a multi-request prefill.
                     if tail_kv_cache is not None and tail_prefix is not None:
@@ -662,7 +662,7 @@ def sparse_attn_indexer_kpool(
             # Paged tail cache replaces the transient _DECODE_TAIL ring. Group
             # the tail group's token-granular slot_mapping per-request, mirroring
             # dec_slot / dec_pos, so the kernel gets each request's current-token
-            # tail slot (block * kpool + pos % kpool).
+            # tail slot (block * ring + pos % ring).
             if tail_meta is not None:
                 assert isinstance(tail_meta, DeepseekV32IndexerMetadata)
             if tail_meta is None or tail_kv_cache is None:
