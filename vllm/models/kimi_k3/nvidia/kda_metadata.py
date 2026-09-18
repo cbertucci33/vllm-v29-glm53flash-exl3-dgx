@@ -36,7 +36,11 @@ from vllm.v1.attention.backends.utils import (
     compute_causal_conv1d_metadata,
     split_decodes_and_prefills,
 )
-from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.kv_cache_interface import (
+    MambaSpec,
+    get_mamba_prefill_checkpoint_position,
+    is_mamba_prefill_checkpoint_valid,
+)
 
 if TYPE_CHECKING:
     from vllm.models.kimi_k3.nvidia.ops.recoverssm import (
@@ -591,11 +595,66 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
             if spec_sequence_masks_cpu is not None:
                 # get non spec request rows
                 request_rows = active_non_spec_mask_cpu.nonzero().flatten().tolist()
-            # Keep Kimi-K3 checkpoint placement identical to the scheduler,
-            # cache manager, and shared GDN builder. In particular, DFlash
-            # owns separate draft KV and must not apply EAGLE/MTP's trailing
-            # target-cache block drop.
-            checkpoint = self._build_checkpoint_metadata(m, request_rows)
+            all_query_lens = query_start_loc_cpu.diff().tolist()
+            query_lens = [all_query_lens[row] for row in request_rows]
+            seq_lens = m.seq_lens_cpu_upper_bound.tolist()
+            block_size = self.kv_cache_spec.block_size
+            hash_block_size = (
+                self.vllm_config.cache_config.prefix_match_unit or block_size
+            )
+            speculative_config = self.vllm_config.speculative_config
+            drop_eagle_block = (
+                speculative_config is not None
+                and speculative_config.use_eagle_block_drop()
+            )
+            checkpoint_splits = []
+            checkpoint_cols = []
+            for row, query_len in zip(request_rows, query_lens):
+                seq_len = seq_lens[row]
+                query_start = seq_len - query_len
+                checkpoint_position = get_mamba_prefill_checkpoint_position(
+                    seq_len,
+                    hash_block_size,
+                    drop_eagle_block=drop_eagle_block,
+                )
+                valid = is_mamba_prefill_checkpoint_valid(
+                    query_start=query_start,
+                    query_end=seq_len,
+                    checkpoint_position=checkpoint_position,
+                    hash_block_size=hash_block_size,
+                    mamba_block_size=block_size,
+                    checkpoint_alignment=FLASHKDA_CHUNK_SIZE,
+                )
+                offset = checkpoint_position - query_start if valid else 0
+                first_len = offset or query_len
+                checkpoint_splits.append((first_len, query_len - first_len))
+                checkpoint_cols.append(
+                    (seq_len + block_size - 1) // block_size - 2 if valid else -1
+                )
+            if any(tail for _, tail in checkpoint_splits):
+                checkpoint_offsets_tensor = async_tensor_h2d(
+                    [first if tail else 0 for first, tail in checkpoint_splits],
+                    dtype=torch.int32,
+                    device=query_start_loc.device,
+                )
+                request_rows_tensor = async_tensor_h2d(
+                    request_rows, dtype=torch.int64, device=query_start_loc.device
+                )
+                checkpoint_cols_tensor = async_tensor_h2d(
+                    checkpoint_cols, dtype=torch.int64, device=query_start_loc.device
+                )
+                checkpoint_state_indices = m.block_table_tensor[
+                    request_rows_tensor, checkpoint_cols_tensor
+                ]
+                checkpoint_state_indices = torch.where(
+                    checkpoint_cols_tensor >= 0,
+                    checkpoint_state_indices,
+                    NULL_BLOCK_ID,
+                )
+                checkpoint = KDACheckpointMetadata(
+                    checkpoint_offsets_tensor,
+                    checkpoint_state_indices,
+                )
 
         # Prepare per-request tensors for cudagraph replay. num_actual_tokens
         # may be token-padded, while state/query/acceptance metadata is indexed
