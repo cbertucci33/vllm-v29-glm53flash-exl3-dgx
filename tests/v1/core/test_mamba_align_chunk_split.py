@@ -149,7 +149,8 @@ def test_dflash_does_not_shift_partial_tail_boundary() -> None:
     )
     with_drop = _split(request, PROMPT_LEN, partial_hit=True)
     assert without_drop == MAMBA_BLOCK_SIZE
-    assert with_drop == MAMBA_BLOCK_SIZE - ATTN_BLOCK_SIZE
+    expected_eagle_tail = PROMPT_LEN // ATTN_BLOCK_SIZE * ATTN_BLOCK_SIZE
+    assert with_drop == expected_eagle_tail - ATTN_BLOCK_SIZE
 
 
 def _run_chunked_prefill(
