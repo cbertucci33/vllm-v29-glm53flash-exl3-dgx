@@ -237,8 +237,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         block_size = self.kv_cache_spec.block_size
         hash_block_size = self.vllm_config.cache_config.prefix_match_unit or block_size
         speculative_config = self.vllm_config.speculative_config
+        # Must match the scheduler/cache-manager capability bit. DFlash reads
+        # target hidden states but owns separate draft KV, so it does not
+        # require EAGLE's trailing target-cache block drop.
         drop_eagle_block = (
-            speculative_config is not None and speculative_config.use_eagle()
+            speculative_config is not None
+            and speculative_config.use_eagle_block_drop()
         )
         checkpoint_splits: list[tuple[int, int]] = []
         checkpoint_cols: list[int] = []

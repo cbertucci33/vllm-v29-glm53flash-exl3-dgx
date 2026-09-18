@@ -1612,8 +1612,9 @@ class MooncakeStoreWorker:
         ]
         spec_cfg = getattr(vllm_config, "speculative_config", None)
         use_eagle = bool(
-            spec_cfg.use_eagle()
-            if spec_cfg is not None and callable(getattr(spec_cfg, "use_eagle", None))
+            spec_cfg.use_eagle_block_drop()
+            if spec_cfg is not None
+            and callable(getattr(spec_cfg, "use_eagle_block_drop", None))
             else False
         )
         self.coord = MooncakeStoreCoordinator(

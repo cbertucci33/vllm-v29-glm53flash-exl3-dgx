@@ -302,7 +302,10 @@ class Scheduler(SchedulerInterface):
             max_model_len=self.max_model_len,
             max_in_flight_tokens=vllm_config.max_in_flight_tokens,
             enable_caching=self.cache_config.enable_prefix_caching,
-            use_eagle=self.use_eagle,
+            # This bit controls target-cache tail dropping, not whether the
+            # speculative method consumes target hidden states. DFlash/DSpark
+            # do the latter but keep their draft KV separate.
+            use_eagle=self.use_eagle_block_drop,
             num_prefill_lookahead=self.num_prefill_lookahead,
             log_stats=self.log_stats,
             enable_kv_cache_events=self.enable_kv_cache_events,

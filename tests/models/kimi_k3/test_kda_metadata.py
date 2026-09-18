@@ -124,7 +124,12 @@ def _make_builder(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_internal_checkpoint_metadata_targets_last_aligned_boundary():
+@pytest.mark.parametrize(
+    ("drop_eagle_block", "expected_offset"), [(False, 48), (True, 32)]
+)
+def test_internal_checkpoint_metadata_targets_last_aligned_boundary(
+    drop_eagle_block: bool, expected_offset: int
+):
     device = torch.device("cuda")
     batch = BatchSpec(seq_lens=[50, 32], query_lens=[50, 16])
     common_attn_metadata = create_common_attn_metadata(
@@ -139,6 +144,12 @@ def test_internal_checkpoint_metadata_targets_last_aligned_boundary():
         device=device,
     )
     assert isinstance(builder, KimiK3KDAMetadataBuilder)
+    # The worker must use the same precise cache-tail capability as the
+    # scheduler/cache manager. DFlash supplies False; EAGLE/MTP supply True.
+    builder.vllm_config.speculative_config = Mock()
+    builder.vllm_config.speculative_config.use_eagle_block_drop.return_value = (
+        drop_eagle_block
+    )
     builder.mamba_aligned_state_indices = mamba_get_block_table_tensor(
         common_attn_metadata.block_table_tensor,
         common_attn_metadata.seq_lens,
@@ -154,7 +165,7 @@ def test_internal_checkpoint_metadata_targets_last_aligned_boundary():
     )
     torch.testing.assert_close(
         actual.checkpoint.checkpoint_offsets,
-        torch.tensor([48, 0], dtype=torch.int32, device=device),
+        torch.tensor([expected_offset, 0], dtype=torch.int32, device=device),
     )
 
 

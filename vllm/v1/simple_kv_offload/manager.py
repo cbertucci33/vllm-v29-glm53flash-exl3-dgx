@@ -125,7 +125,9 @@ class SimpleCPUOffloadScheduler:
         )
 
         spec_config = vllm_config.speculative_config
-        use_eagle = spec_config is not None and spec_config.use_eagle()
+        use_eagle = (
+            spec_config is not None and spec_config.use_eagle_block_drop()
+        )
         self.cpu_coordinator: KVCacheCoordinator = get_kv_cache_coordinator(
             kv_cache_config=self.cpu_kv_cache_config,
             max_model_len=vllm_config.model_config.max_model_len,
