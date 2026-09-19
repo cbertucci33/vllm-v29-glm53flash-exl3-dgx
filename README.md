@@ -18,7 +18,7 @@ source revision, rank-sliced checkpoint, DFlash checkpoint, and runtime flags.
 1. Check out the release and prepare the pinned build inputs:
 
    ```bash
-   git checkout v3.0.0
+   git checkout v4.0.0
    ```
 
    Follow [`build/README.md`](build/README.md) to verify the pinned sources,
@@ -54,6 +54,40 @@ source revision, rank-sliced checkpoint, DFlash checkpoint, and runtime flags.
 These results come from one two-node DGX Spark deployment. They are operational
 measurements, not hardware limits or broad benchmark claims.
 
+### Release 4 production sample
+
+Release 4 accumulated 232 organic requests over an eight-hour production
+window. The workload used an 800,000-token model limit, DFlash2 with seven
+proposals, and a 971,162-token cache. Prompt length, output length, cache
+warmth, reasoning depth, and concurrency varied.
+
+| Measurement | Result |
+| --- | --- |
+| Completed requests | 232 of 232 |
+| Errors, aborts, or repetition stops | 0 |
+| Prompt tokens | 17,005,926 |
+| Mean prompt length | 73,301 tokens |
+| Generated tokens | 72,083 |
+| Prefix-cache reuse | 91.4% |
+| Mean per-request generation throughput | 33.3 tokens/s |
+| Token-weighted generation throughput | 27.6 tokens/s |
+| Mean time to first token | 4.18 s |
+| Mean decode time | 11.27 s |
+| Mean end-to-end request time | 15.45 s |
+| Overall draft-token acceptance | 26.3% |
+| Useful tokens per verification step | 2.84 |
+| Draft acceptance by position, 1 through 7 | 61.4%, 41.2%, 28.4%, 20.1%, 14.4%, 10.6%, 8.0% |
+| Requests reaching first token within 5 s | 87.5% |
+| Requests completing within 20 s | 81.5% |
+
+Both tensor-parallel ranks remained up with zero restarts. The sample contained
+no request errors, aborts, or repetition stops.
+
+Mean per-request generation throughput is the reciprocal of mean request TPOT.
+Token-weighted generation throughput divides all generated tokens by total
+decode time. Both values are reported because long outputs carry more weight
+in the second calculation.
+
 ### Release 3 cached-prefix acceptance
 
 The final Release 3 image was accepted through the production telemetry path
@@ -67,34 +101,29 @@ with DFlash2 configured for seven proposals and a 971,162-token cache.
 Both requests returned HTTP 200. Both ranks remained up with zero restarts or
 post-start errors. The accepted runtime source ends at commit `73c0212232`.
 
-### Latest extended production sample
+## Release 4
 
-The latest substantial production sample is a 286-request Release 2 tool
-workload. Release 3 has passed focused corruption regressions and the
-cached-prefix acceptance above, but it has not yet accumulated a comparable
-long-run sample.
+Release 4 restores the optimized NVIDIA GLM K-pool numerical paths after the
+Release 3 cache-correctness work and fixes DFlash prefix-checkpoint retention.
+The runtime source ends at commit `3dc58d9ee0`.
 
-| Measurement | Result |
-| --- | --- |
-| Completed requests | 286 of 286, all HTTP 200 |
-| Errors or aborts | 0 |
-| Prompt tokens | 35,276,415 |
-| Generated tokens | 94,321 |
-| Prefix-cache reuse | 96.1% |
-| Weighted decode throughput | 29.0 tokens/s |
-| Mean time to first token | 3.45 s |
-| Mean prefill time | 3.28 s |
-| Mean decode time | 11.38 s |
-| Mean end-to-end request time | 14.83 s |
-| Overall draft-token acceptance | 29.5% |
-| Useful tokens per verification step | 3.06 |
-| Draft acceptance by position, 1 through 7 | 68.3%, 46.6%, 32.2%, 22.4%, 16.3%, 12.0%, 8.8% |
-| Requests reaching first token within 5 s | 96.5% |
-| Requests completing within 20 s | 80.8% |
+Changes in this release:
 
-The production sample used an 800,000-token model limit, three sequence slots,
-a 16,384-token batch budget, and 10.2 GB of KV-cache memory per rank. Prompt
-length, output length, cache warmth, reasoning depth, and concurrency varied.
+- restored CUDA head gating to BF16 operands with FP32 accumulation and cached
+  the transposed projection weight;
+- restored the online FP32 softmax update in the NVIDIA K-pool prefill and
+  decode kernels, avoiding the extra max-reduction pass while retaining stable
+  accumulation;
+- changed the hybrid prefix-cache retention decision to use the precise
+  target-cache block-drop capability instead of the broader EAGLE-family
+  capability; and
+- kept DFlash and DSpark on sparse checkpoint retention because their draft KV
+  is separate from the target cache. This prevents transient internal
+  checkpoints from being published as reusable shared-prefix state.
+
+The production sample above is the release acceptance record. It covers 232
+organic requests with a 73,301-token mean prompt, zero request failures, and
+33.3 tokens/s mean per-request generation throughput.
 
 ## Release 3
 
