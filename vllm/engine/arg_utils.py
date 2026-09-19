@@ -2404,15 +2404,16 @@ class EngineArgs:
             retention_interval_unset
             and model_config.is_hybrid
             and speculative_config is not None
-            and speculative_config.use_eagle()
+            and speculative_config.use_eagle_block_drop()
         ):
             # The default sparse retention (0) keeps only the latest replay
-            # boundary, which EAGLE's tail-block drop makes unreachable for
-            # Mamba state checkpoints, so prefix caching never hits. Default
-            # to dense checkpoints instead.
+            # boundary, which target-cache tail dropping makes unreachable for
+            # Mamba state checkpoints. DFlash and DSpark use separate draft KV
+            # and must retain the sparse default so transient internal
+            # checkpoints are not published into the shared prefix cache.
             cache_config.prefix_cache_retention_interval = None
             logger.info_once(
-                "Hybrid model with EAGLE speculative decoding: defaulting "
+                "Hybrid model with target-cache tail dropping: defaulting "
                 "prefix_cache_retention_interval to dense checkpointing."
             )
 
