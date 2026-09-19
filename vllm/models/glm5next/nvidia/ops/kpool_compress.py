@@ -175,7 +175,7 @@ def _kpool_softmax_rotate_write_cache_kernel(
     WRITE_CACHE: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    """One program per pool row: two-pass softmax(score+ape)-weighted sum of K
+    """One program per pool row: online softmax(score+ape)-weighted sum of K
     -> Hadamard-128 -> per-vector fp8 absmax quant -> write at ``loc``.
 
     Slot ``s`` of row ``r`` is read at ``(r - row_offset) * stride_row +
@@ -195,21 +195,7 @@ def _kpool_softmax_rotate_write_cache_kernel(
     k_base = k_ptr + base * k_stride_row
     score_base = score_ptr + base * score_stride_row
 
-    # Preserve the pre-#57161 numerical contract. The online update is
-    # mathematically equivalent, but its different fp32 reduction order can
-    # move near-tie pooled keys across an FP8 quantization boundary. Those keys
-    # drive sparse-attention top-k selection, so the difference compounds with
-    # long contexts.
-    max_score = tl.full((BLOCK_D,), -float("inf"), tl.float32)
-    for slot in tl.static_range(0, POOL_SIZE):
-        score = tl.load(
-            score_base + slot * score_stride_slot + offs, mask=mask, other=0.0
-        ).to(tl.float32)
-        score += tl.load(
-            ape_ptr + slot * ape_stride_0 + offs, mask=mask, other=0.0
-        ).to(tl.float32)
-        max_score = tl.maximum(max_score, score)
-
+    m = tl.full((BLOCK_D,), -float("inf"), tl.float32)
     acc = tl.zeros((BLOCK_D,), tl.float32)
     denom = tl.zeros((BLOCK_D,), tl.float32)
     for slot in tl.static_range(0, POOL_SIZE):
@@ -222,9 +208,12 @@ def _kpool_softmax_rotate_write_cache_kernel(
         k = tl.load(k_base + slot * k_stride_slot + offs, mask=mask, other=0.0).to(
             tl.float32
         )
-        prob = tl.exp(score - max_score)
-        denom += prob
-        acc += k * prob
+        new_m = tl.maximum(m, score)
+        rescale = tl.exp(m - new_m)
+        prob = tl.exp(score - new_m)
+        denom = denom * rescale + prob
+        acc = acc * rescale + k * prob
+        m = new_m
 
     quantized, scale = _hadamard_quantize_fp8(acc, denom, ROUND_SCALE)
 
@@ -568,23 +557,7 @@ def _kpool_decode_update_batched_kernel(
         if pos_valid & (slot == POOL_SIZE - 1):
             pool_logical_start = safe_pos - slot
 
-            max_score = tl.full((BLOCK_D,), -float("inf"), tl.float32)
-            for pool_slot in tl.static_range(0, POOL_SIZE):
-                is_current = pool_slot == slot
-                phys = (pool_logical_start + pool_slot) % RING
-                score_buf = tl.load(
-                    tail_kv_ptr + block_base + KPOOL_HEAD + phys * HEAD_DIM + offs,
-                    mask=dim_mask,
-                    other=0.0,
-                ).to(tl.float32)
-                score = tl.where(is_current, score_current, score_buf)
-                score += tl.load(
-                    ape_ptr + pool_slot * ape_stride_0 + offs,
-                    mask=dim_mask,
-                    other=0.0,
-                ).to(tl.float32)
-                max_score = tl.maximum(max_score, score)
-
+            m = tl.full((BLOCK_D,), -float("inf"), tl.float32)
             acc = tl.zeros((BLOCK_D,), tl.float32)
             denom = tl.zeros((BLOCK_D,), tl.float32)
             for pool_slot in tl.static_range(0, POOL_SIZE):
@@ -607,9 +580,12 @@ def _kpool_decode_update_batched_kernel(
                     other=0.0,
                 ).to(tl.float32)
                 k = tl.where(is_current, key, k_buf)
-                prob = tl.exp(score - max_score)
-                denom += prob
-                acc += k * prob
+                new_m = tl.maximum(m, score)
+                rescale = tl.exp(m - new_m)
+                prob = tl.exp(score - new_m)
+                denom = denom * rescale + prob
+                acc = acc * rescale + k * prob
+                m = new_m
 
             quantized, scale = _hadamard_quantize_fp8(acc, denom, ROUND_SCALE)
 
