@@ -55,84 +55,63 @@ source revision, rank-sliced checkpoint, DFlash checkpoint, and runtime flags.
 
 ## Current performance
 
-These results come from one two-node DGX Spark deployment. They are operational
-measurements, not hardware limits or broad benchmark claims.
+This Release 5 snapshot covers 922 completed organic requests on one two-node
+DGX Spark deployment. The runtime used an 800,000-token model limit, a
+971,162-token cache, and DFlash2 with seven proposals. Prompt length, output
+length, cache warmth, reasoning depth, and concurrency varied. These are
+production observations, not hardware limits or a controlled benchmark.
 
-### Release 5 production throughput
+### Generation throughput
 
-Release 5 improves high-throughput decoding while preserving the cached-prefix
-latency established by the preceding releases. The table compares active
-approximately 10-second generation intervals from the original Release 1
-deployment with the final Release 5 deployment.
-
-| Measurement | Release 1 | Release 5 | Change |
-| --- | ---: | ---: | ---: |
-| Mean generation throughput | 22.6 tokens/s | 23.7 tokens/s | +5% |
-| P90 generation throughput | 36.3 tokens/s | 43.8 tokens/s | +21% |
-
-Release 5 recorded a standalone observed peak of **65.8 tokens/s**. Its 296
-active intervals had a median of 20.8 tokens/s. Median DFlash acceptance was
-28.0%, median useful span was 2.96 tokens per verification step, and the P90
-useful span was 5.78 tokens.
-
-The Release 1 values were reconstructed from archived two-second cumulative
-token counters. Five possible sampling phases produced means from 22.62 to
-22.64 tokens/s and P90 values from 36.07 to 36.48 tokens/s. The table reports
-the rounded central values. The original Release 1 vLLM interval logs were not
-retained, so no Release 1 peak is reported. Release 5 values come from the
-native vLLM interval logger. These are production observations with different
-workloads, not a controlled hardware benchmark.
-
-Release 5 also passed a production-path cached-prefix check: a 32,025-token
-continuation reused 27,648 cached tokens and completed in 2.886 seconds. Both
-tensor-parallel ranks remained up with zero restarts during acceptance.
-
-### Release 4 production sample
-
-Release 4 accumulated 232 organic requests over an eight-hour production
-window. The workload used an 800,000-token model limit, DFlash2 with seven
-proposals, and a 971,162-token cache. Prompt length, output length, cache
-warmth, reasoning depth, and concurrency varied.
+The native vLLM interval logger reports generation throughput approximately
+every 10 seconds. Intervals with no generated tokens are excluded.
 
 | Measurement | Result |
-| --- | --- |
-| Completed requests | 232 of 232 |
-| Errors, aborts, or repetition stops | 0 |
-| Prompt tokens | 17,005,926 |
-| Mean prompt length | 73,301 tokens |
-| Generated tokens | 72,083 |
-| Prefix-cache reuse | 91.4% |
-| Mean per-request generation throughput | 33.3 tokens/s |
-| Token-weighted generation throughput | 27.6 tokens/s |
-| Mean time to first token | 4.18 s |
-| Mean decode time | 11.27 s |
-| Mean end-to-end request time | 15.45 s |
-| Overall draft-token acceptance | 26.3% |
-| Useful tokens per verification step | 2.84 |
-| Draft acceptance by position, 1 through 7 | 61.4%, 41.2%, 28.4%, 20.1%, 14.4%, 10.6%, 8.0% |
-| Requests reaching first token within 5 s | 87.5% |
-| Requests completing within 20 s | 81.5% |
+| --- | ---: |
+| Active generation intervals | 1,489 |
+| Generated tokens | 349,439 |
+| Mean throughput | 23.5 tokens/s |
+| Median throughput | 21.2 tokens/s |
+| P90 throughput | 39.7 tokens/s |
+| Peak throughput | 65.8 tokens/s |
 
-Both tensor-parallel ranks remained up with zero restarts. The sample contained
-no request errors, aborts, or repetition stops.
+### Responsiveness and cache reuse
 
-Mean per-request generation throughput is the reciprocal of mean request TPOT.
-Token-weighted generation throughput divides all generated tokens by total
-decode time. Both values are reported because long outputs carry more weight
-in the second calculation.
+| Measurement | Result |
+| --- | ---: |
+| Completed requests | 922 of 922 |
+| Errors, aborts, length stops, or repetition stops | 0 |
+| Prompt tokens | 107,005,934 |
+| Mean prompt length | 116,058 tokens |
+| Cached prompt tokens | 102,638,592 |
+| Prefix-cache reuse | 95.9% |
+| Newly computed prompt tokens | 4,367,342 |
+| Aggregate prompt-processing throughput | 1,423 tokens/s |
+| Mean prefill time | 3.33 s |
+| Mean time to first token | 3.54 s |
+| Mean end-to-end request time | 15.94 s |
 
-### Release 3 cached-prefix acceptance
+Prompt-processing throughput divides newly computed prompt tokens by total
+prefill time. Prefix-cache reuse divides cached prompt tokens by queried prompt
+tokens.
 
-The final Release 3 image was accepted through the production telemetry path
-with DFlash2 configured for seven proposals and a 971,162-token cache.
+### DFlash2 acceptance
 
-| Request | Input tokens | Cached tokens | Output | Time |
-| --- | ---: | ---: | --- | ---: |
-| Cold prefix | 33,822 | 0 | exact `WARM_PREFIX_OK` | 19.603 s |
-| Shared-prefix continuation | 33,828 | 27,648 | exact `CACHED_CONTINUATION_OK` | 3.553 s |
+| Measurement | Result |
+| --- | ---: |
+| Verification steps | 106,724 |
+| Draft tokens | 747,064 |
+| Accepted draft tokens | 242,698 |
+| Overall draft-token acceptance | 32.5% |
+| Accepted draft tokens per verification step | 2.27 |
+| Effective verification span | 3.27 tokens |
 
-Both requests returned HTTP 200. Both ranks remained up with zero restarts or
-post-start errors. The accepted runtime source ends at commit `73c0212232`.
+| Draft position | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Acceptance | 70.4% | 48.8% | 34.9% | 26.0% | 19.7% | 15.4% | 12.1% |
+
+The effective verification span includes the target token produced by each
+verification step.
 
 ## Release 5
 
@@ -188,10 +167,6 @@ Changes in this release:
 - kept DFlash and DSpark on sparse checkpoint retention because their draft KV
   is separate from the target cache. This prevents transient internal
   checkpoints from being published as reusable shared-prefix state.
-
-The production sample above is the release acceptance record. It covers 232
-organic requests with a 73,301-token mean prompt, zero request failures, and
-33.3 tokens/s mean per-request generation throughput.
 
 ## Release 3
 
@@ -426,38 +401,6 @@ maximum. Five proposals were also smoke-tested. Select the proposal count from
 measured acceptance and end-to-end throughput for the intended workload.
 
 Set model length, sequence concurrency, batch-token limits, KV memory, network addresses, ports, model paths, and chat defaults for the target deployment. Effective context and concurrency depend on checkpoint geometry, cache allocation, request mix, and available memory.
-
-## Historical measurements
-
-These measurements come from one two-node DGX Spark deployment. They are not hardware limits or broad benchmark claims.
-
-### Earlier seven-proposal baseline
-
-The earlier real-use sample was also collected with seven proposals:
-
-| Measurement | Result |
-| --- | --- |
-| Completed requests | 197 of 197, all HTTP 200 |
-| Prompt tokens | 24.35 million |
-| Generated tokens | 283,800 |
-| Weighted decode throughput | 24.5 tokens/s |
-| Previous runtime on the same hardware | 21.62 tokens/s |
-| Overall change | +13.3% |
-| Matched 40K to 100K prompts | 26.02 vs 22.65 tokens/s, +14.9% |
-| Matched 100K to 200K prompts | 24.22 vs 21.55 tokens/s, +12.4% |
-| Prefix-cache reuse | 93.6% |
-| Errors, disconnects, or capacity waits | 0 |
-
-The five-proposal update has a bounded smoke test, not a long-run performance claim:
-
-| Measurement | Result |
-| --- | --- |
-| Draft accounting | 263 verification steps x 5 proposals = 1,315 drafts |
-| Draft positions exposed | positions 0 through 4 only |
-| Text completion | HTTP 200, normal stop, correct visible answer |
-| Code completion | HTTP 200, normal stop, correct expression |
-| Tool use | HTTP 200, valid structured tool call |
-| Runtime state | no waits, restarts, OOMs, or logged errors |
 
 ## Validation
 
