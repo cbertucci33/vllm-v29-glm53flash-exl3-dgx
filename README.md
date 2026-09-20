@@ -122,11 +122,15 @@ The runtime source ends at commit `10b33ab40e`.
 
 Changes in this release:
 
-- materialized the exact DFlash replay boundary before publishing recurrent
+- completed the GLM KDA checkpoint path from
+  [vLLM #56960](https://github.com/vllm-project/vllm/pull/56960) by
+  materializing the exact DFlash replay boundary before publishing recurrent
   state, so a later request cannot restore a logical checkpoint that was never
   written by a forward pass;
-- separated DFlash draft-group identity from EAGLE and MTP target-cache tail
-  dropping across the scheduler and hybrid cache coordinator;
+- completed the DFlash and DSpark capability split from
+  [vLLM #54163](https://github.com/vllm-project/vllm/pull/54163) by separating
+  draft-group identity from EAGLE and MTP target-cache tail dropping across
+  the scheduler and hybrid cache coordinator;
 - applied the DFlash replay reserve consistently to local prefix caching,
   NIXL, Mooncake, generic KV offload, and CPU offload restore paths;
 - kept the private DFlash history ring out of external cache transfer while
@@ -137,9 +141,10 @@ Changes in this release:
 - added copy-on-write ownership for every published Mamba, KDA, and
   convolution snapshot before a producer or cache-hit consumer mutates the
   underlying state page;
-- replaced atomic arrival-order emission in the GB10 persistent TopK kernel
-  with deterministic index-ranked selection, including lowest-index tie
-  handling and signed-zero normalization; and
+- adapted the deterministic persistent TopK work from
+  [vLLM #55122](https://github.com/vllm-project/vllm/pull/55122), replacing
+  atomic arrival-order emission in the GB10 kernel with index-ranked
+  selection, lowest-index tie handling, and signed-zero normalization; and
 - kept unsupported cooperative TopK paths fail-closed on GB10.
 
 Focused verification covered producer and consumer copy-on-write ownership,
@@ -156,17 +161,19 @@ The runtime source ends at commit `3dc58d9ee0`.
 
 Changes in this release:
 
-- restored CUDA head gating to BF16 operands with FP32 accumulation and cached
-  the transposed projection weight;
-- restored the online FP32 softmax update in the NVIDIA K-pool prefill and
-  decode kernels, avoiding the extra max-reduction pass while retaining stable
-  accumulation;
-- changed the hybrid prefix-cache retention decision to use the precise
-  target-cache block-drop capability instead of the broader EAGLE-family
-  capability; and
-- kept DFlash and DSpark on sparse checkpoint retention because their draft KV
-  is separate from the target cache. This prevents transient internal
-  checkpoints from being published as reusable shared-prefix state.
+- completed the optimized numerical path from
+  [vLLM #57161](https://github.com/vllm-project/vllm/pull/57161), restoring
+  CUDA head gating to BF16 operands with FP32 accumulation, caching the
+  transposed projection weight, and using online FP32 softmax in NVIDIA
+  K-pool prefill and decode;
+- applied the precise DFlash and DSpark target-cache block-drop capability
+  from [vLLM #54163](https://github.com/vllm-project/vllm/pull/54163) instead
+  of the broader EAGLE-family capability; and
+- activated the transient-checkpoint protection from
+  [vLLM #56794](https://github.com/vllm-project/vllm/pull/56794) by keeping
+  DFlash and DSpark on sparse checkpoint retention. Their separate draft KV
+  no longer causes transient internal checkpoints to be published as reusable
+  shared-prefix state.
 
 ## Release 3
 
@@ -212,12 +219,17 @@ runtime source ends at commit `e3c9c6943`.
 
 Changes in this release:
 
-- backported NVIDIA's K-pool scheduling work and internal KDA prefill
-  checkpoints;
-- completed the scheduler, cache-manager, and worker control path for internal
-  checkpoints;
-- restored FP32 operands for sparse-attention head gating and the stable
-  two-pass FP32 K-pool softmax;
+- backported the NVIDIA K-pool scheduling work from
+  [vLLM #57161](https://github.com/vllm-project/vllm/pull/57161) and the
+  internal KDA prefill checkpoints from
+  [vLLM #56960](https://github.com/vllm-project/vllm/pull/56960);
+- completed the scheduler, cache-manager, and worker control path for the KDA
+  checkpoints introduced by
+  [vLLM #56960](https://github.com/vllm-project/vllm/pull/56960);
+- retained stable numerics around
+  [vLLM #57161](https://github.com/vllm-project/vllm/pull/57161) by restoring
+  FP32 operands for sparse-attention head gating and the two-pass FP32 K-pool
+  softmax;
 - preserved streamed reasoning, message, and function-call identities in the
   final OpenAI Responses object, including tool-call IDs and message logprobs;
 - required an explicit prefix-match unit for FlashKDA checkpoints and promoted
