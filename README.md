@@ -1,4 +1,4 @@
-<b><font color="red">Important!</font></b>*We are continuously updating this repo to fix bugs and implement upstream PR's from vLLM. Please check back for new releases to improve performance and stability.
+**Important!** *We are continuously updating this repo to fix bugs and implement upstream PR's from vLLM. Please check back for new releases to improve performance and stability.*
 
 # GLM-5.3 Flash EXL3 on DGX Spark
 
