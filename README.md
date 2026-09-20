@@ -1,3 +1,5 @@
+<b><font color="red">Important!</font></b>*We are continuously updating this repo to fix bugs and implement upstream PR's from vLLM. Please check back for new releases to improve performance and stability.
+
 # GLM-5.3 Flash EXL3 on DGX Spark
 
 This repository records the work required to serve a rank-sliced GLM-5.3 Flash EXL3 checkpoint with DFlash2 speculative decoding on two NVIDIA DGX Spark systems. It is based on vLLM 0.29.0. Model weights are published separately.
