@@ -12,6 +12,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     KVCacheBlock,
     dcp_world_size_for_kv_cache_spec,
+    get_draft_replay_boundary,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
@@ -95,6 +96,9 @@ class KVCacheCoordinator(ABC):
         )
         self.scheduler_block_size = scheduler_block_size
         self.num_reprefillable_tokens = max(0, num_prefill_lookahead - 1)
+        # Set by KVCacheManager after it resolves any DFlash/DSpark draft
+        # context that must be replayed instead of restored from target APC.
+        self.draft_replay_reserve = 0
 
         self.block_pool = BlockPool(
             num_gpu_blocks=kv_cache_config.num_blocks,
@@ -104,12 +108,20 @@ class KVCacheCoordinator(ABC):
             metrics_collector=metrics_collector,
         )
 
-        # KV cache group indices that get the EAGLE last-block drop.
-        self.eagle_group_ids: set[int] = {
+        # ``is_eagle_group`` identifies draft-attention groups. It is broader
+        # than the target-cache mutation capability: DFlash/DSpark have draft
+        # groups, but their private KV never pollutes the target's trailing
+        # block. Keep the descriptive IDs separate from the groups that
+        # actually require EAGLE/MTP last-block replay.
+        self.draft_group_ids: set[int] = {
             i for i, g in enumerate(kv_cache_config.kv_cache_groups) if g.is_eagle_group
         }
+        self.use_eagle_block_drop = use_eagle
+        self.eagle_group_ids: set[int] = (
+            set(self.draft_group_ids) if self.use_eagle_block_drop else set()
+        )
         # Conservatively fall back to flag all groups when no group is flagged.
-        if use_eagle and not self.eagle_group_ids:
+        if self.use_eagle_block_drop and not self.eagle_group_ids:
             self.eagle_group_ids = set(range(len(kv_cache_config.kv_cache_groups)))
 
         # During chunked prefill with EAGLE, the single next prefill lookahead
@@ -312,11 +324,20 @@ class KVCacheCoordinator(ABC):
         keep around it -- EAGLE groups also keep the block above, which they
         match and drop back from (see ``reachable_block_mask``).
 
-        Under EAGLE that block must exist, so the boundary sits one alignment
-        unit below the prompt's last aligned position; every group's block size
-        divides the alignment, so the block above always fits in the prompt.
+        DFlash/DSpark must replay enough target tokens to rebuild their private
+        draft-attention window, so their boundary is the last scheduler-aligned
+        position below that reserve. Under EAGLE/MTP, the volatile target block
+        must exist and then be dropped, so the boundary instead sits one
+        alignment unit below the prompt's last aligned position. Every group's
+        block size divides the scheduler alignment in both cases.
         """
-        if not self.eagle_group_ids:
+        if self.draft_replay_reserve:
+            return get_draft_replay_boundary(
+                request.num_prompt_tokens,
+                self.draft_replay_reserve,
+                self.scheduler_block_size,
+            )
+        if not self.use_eagle_block_drop:
             return request.num_prompt_tokens - 1
         aligned = (
             request.num_prompt_tokens

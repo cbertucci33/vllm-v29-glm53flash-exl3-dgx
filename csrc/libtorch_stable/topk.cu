@@ -3,7 +3,6 @@
 
 #include <cuda_runtime.h>
 #include <algorithm>
-#include <cstdlib>
 
 #include "torch_utils.h"
 
@@ -46,15 +45,10 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
   // would fall back to the 128KB FilteredTopK these parts can't allocate) and
   // removes the cooperative spin-wait barrier, which is fragile under a
   // CUDA-graph-captured NCCL collective co-resident on the same SMs.
-  // Escape hatch for A/B + emergencies: VLLM_TOPK_DISABLE_NONCOOP=1 keeps the
-  // cooperative path even on <128KB parts (works below the oversubscribe ceiling;
-  // hard-fails above it -- diagnostic use only).
-  static const bool s_disable_noncoop = [] {
-    const char* e = getenv("VLLM_TOPK_DISABLE_NONCOOP");
-    return e && e[0] == '1';
-  }();
-  const bool force_noncooperative =
-      (max_smem_per_block < 128 * 1024) && !s_disable_noncoop;
+  // The cooperative path cannot satisfy its shared-memory contract on GB10.
+  // Keep this fail-closed: a diagnostic environment override must not silently
+  // restore the unsupported and nondeterministic path in production.
+  const bool force_noncooperative = max_smem_per_block < 128 * 1024;
 
   if (num_rows > 32 && max_smem_per_block >= 128 * 1024) {
     cudaError_t status =

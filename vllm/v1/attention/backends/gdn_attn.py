@@ -559,24 +559,26 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
         if (
             self.use_full_cuda_graph
-            and num_prefills == 0
             and num_spec_decodes == 0
-            and num_decodes <= self.decode_cudagraph_max_bs
+            and m.max_query_len <= 1
+            and batch_size <= self.decode_cudagraph_max_bs
         ):
-            self.non_spec_state_indices_tensor[:num_decodes].copy_(
+            # Decode-graph dispatch is shape based and happens before this
+            # metadata is built. A one-token stateless first chunk is a
+            # prefill semantically but still replays the decode graph, so stage
+            # every real request row instead of leaving the previous batch's
+            # persistent state indices in place.
+            self.non_spec_state_indices_tensor[:batch_size].copy_(
                 non_spec_state_indices_tensor, non_blocking=True
             )
             non_spec_state_indices_tensor = self.non_spec_state_indices_tensor[
                 :batch_size
             ]
-            non_spec_state_indices_tensor[num_decodes:].fill_(NULL_BLOCK_ID)
 
-            self.non_spec_query_start_loc[: num_decodes + 1].copy_(
+            self.non_spec_query_start_loc[: batch_size + 1].copy_(
                 non_spec_query_start_loc, non_blocking=True
             )
-            non_spec_num_query_tokens = non_spec_query_start_loc[-1]  # type: ignore[index]
             non_spec_query_start_loc = self.non_spec_query_start_loc[: batch_size + 1]
-            non_spec_query_start_loc[num_decodes + 1 :].fill_(non_spec_num_query_tokens)
 
         checkpoint = None
         if num_prefills > 0:

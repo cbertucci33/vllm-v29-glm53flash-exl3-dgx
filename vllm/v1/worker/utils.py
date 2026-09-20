@@ -134,7 +134,8 @@ class KVBlockZeroer:
         Each virtual block is represented as an independent segment so its
         physical block stride and zeroed page span remain independent.
 
-        Only AttentionSpec layers are processed; Mamba layers are skipped.
+        Attention and Mamba state layers are processed. Tuple-backed Mamba
+        caches are split into independently zeroed tensor segments.
         """
         self.device = device
         self._meta: (
@@ -153,7 +154,7 @@ class KVBlockZeroer:
 
         for group in attn_groups_iter:
             spec = group.kv_cache_spec
-            if not isinstance(spec, AttentionSpec):
+            if not isinstance(spec, (AttentionSpec, MambaSpec)):
                 continue
             if group.kv_cache_group_id >= len(kernel_block_sizes):
                 continue
@@ -162,51 +163,59 @@ class KVBlockZeroer:
             for layer_name in group.layer_names:
                 if layer_name in runner_only_attn_layers:
                     continue
-                kv = static_forward_context[layer_name].kv_cache
-                if not isinstance(kv, torch.Tensor):
-                    continue
-                dp = kv.data_ptr()
-
-                assert kv.shape[0] % num_blocks == 0, (
-                    f"{layer_name}: {kv.shape[0]} kernel blocks is not a "
-                    f"multiple of {num_blocks} logical blocks"
+                layer_cache = static_forward_context[layer_name].kv_cache
+                kvs = (
+                    list(layer_cache)
+                    if isinstance(layer_cache, (list, tuple))
+                    else [layer_cache]
                 )
-                ratio = kv.shape[0] // num_blocks
+                for kv in kvs:
+                    if not isinstance(kv, torch.Tensor):
+                        continue
+                    dp = kv.data_ptr()
 
-                el = kv.element_size()
-                block_stride_bytes = kv.stride(0) * el
-                assert block_stride_bytes % 4 == 0
-                assert kv.shape[0] % ratio == 0
-                outer_dims = [
-                    d
-                    for d in range(1, kv.ndim)
-                    if kv.stride(d) * el > block_stride_bytes
-                ]
-                outer_strides = [kv.stride(d) * el for d in outer_dims]
-                inner_dims = [d for d in range(1, kv.ndim) if d not in outer_dims]
-                kernel_page_bytes = el + sum(
-                    (kv.shape[d] - 1) * kv.stride(d) * el for d in inner_dims
-                )
-                assert kernel_page_bytes % 4 == 0
-                logical_block_stride_bytes = block_stride_bytes * ratio
-                for outer in iprod(*(range(kv.shape[d]) for d in outer_dims)):
-                    off_bytes = sum(i * s for i, s in zip(outer, outer_strides))
-                    assert (dp + off_bytes) % 4 == 0
-                    for virtual_index in range(ratio):
-                        addr = dp + off_bytes + virtual_index * block_stride_bytes
-                        if (idx := seen_ptrs.get(addr)) is not None:
-                            assert (
-                                seg_block_strides[idx]
-                                == logical_block_stride_bytes // 4
-                            )
-                            seg_page_sizes[idx] = max(
-                                seg_page_sizes[idx], kernel_page_bytes // 4
-                            )
-                            continue
-                        seen_ptrs[addr] = len(seg_addrs)
-                        seg_addrs.append(addr)
-                        seg_block_strides.append(logical_block_stride_bytes // 4)
-                        seg_page_sizes.append(kernel_page_bytes // 4)
+                    assert kv.shape[0] % num_blocks == 0, (
+                        f"{layer_name}: {kv.shape[0]} kernel blocks is not a "
+                        f"multiple of {num_blocks} logical blocks"
+                    )
+                    ratio = kv.shape[0] // num_blocks
+
+                    el = kv.element_size()
+                    block_stride_bytes = kv.stride(0) * el
+                    assert block_stride_bytes % 4 == 0
+                    assert kv.shape[0] % ratio == 0
+                    outer_dims = [
+                        d
+                        for d in range(1, kv.ndim)
+                        if kv.stride(d) * el > block_stride_bytes
+                    ]
+                    outer_strides = [kv.stride(d) * el for d in outer_dims]
+                    inner_dims = [
+                        d for d in range(1, kv.ndim) if d not in outer_dims
+                    ]
+                    kernel_page_bytes = el + sum(
+                        (kv.shape[d] - 1) * kv.stride(d) * el for d in inner_dims
+                    )
+                    assert kernel_page_bytes % 4 == 0
+                    logical_block_stride_bytes = block_stride_bytes * ratio
+                    for outer in iprod(*(range(kv.shape[d]) for d in outer_dims)):
+                        off_bytes = sum(i * s for i, s in zip(outer, outer_strides))
+                        assert (dp + off_bytes) % 4 == 0
+                        for virtual_index in range(ratio):
+                            addr = dp + off_bytes + virtual_index * block_stride_bytes
+                            if (idx := seen_ptrs.get(addr)) is not None:
+                                assert (
+                                    seg_block_strides[idx]
+                                    == logical_block_stride_bytes // 4
+                                )
+                                seg_page_sizes[idx] = max(
+                                    seg_page_sizes[idx], kernel_page_bytes // 4
+                                )
+                                continue
+                            seen_ptrs[addr] = len(seg_addrs)
+                            seg_addrs.append(addr)
+                            seg_block_strides.append(logical_block_stride_bytes // 4)
+                            seg_page_sizes.append(kernel_page_bytes // 4)
 
         if not seg_addrs:
             self._meta = None
@@ -639,6 +648,13 @@ def bind_kv_cache(
     # layer for the KV connector to register.
     for layer_name, kv_cache in kv_caches.items():
         forward_context[layer_name].bind_kv_cache(kv_cache)
+
+
+def zero_null_kv_block(kv_caches: Iterable[torch.Tensor]) -> None:
+    """Restore reserved block 0 after dummy CUDA-graph capture."""
+    for kv_cache in kv_caches:
+        if kv_cache.numel() and kv_cache.shape[0]:
+            kv_cache[0].zero_()
 
 
 def clear_layer_kv_caches(layers: Iterable[Any]) -> None:

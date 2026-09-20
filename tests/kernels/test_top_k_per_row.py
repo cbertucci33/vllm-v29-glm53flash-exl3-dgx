@@ -1286,8 +1286,8 @@ def test_persistent_topk_low_smem_long_rows_are_exact(
     set_random_seed(7)
     logits = torch.randn(num_rows, seq_len, dtype=torch.float32, device="cuda")
     if num_rows > 1:
-        # Exercise a dense tie at the cutoff. Index choice may differ, but the
-        # selected value multiset must match torch.topk exactly.
+        # Exercise a dense tie at the cutoff. The GB10 path resolves ties by
+        # lowest source index and must remain replay-stable.
         logits[1, : top_k + 64] = 1.0
     lengths = torch.full((num_rows,), seq_len, dtype=torch.int32, device="cuda")
     indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
@@ -1300,6 +1300,46 @@ def test_persistent_topk_low_smem_long_rows_are_exact(
     actual = logits.gather(1, indices.to(torch.int64)).sort(dim=1).values
     expected = logits.topk(top_k, dim=1).values.sort(dim=1).values
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@torch.inference_mode()
+def test_persistent_topk_low_smem_is_deterministic() -> None:
+    """Identical GB10 rows must produce byte-identical selected indices."""
+    props = torch.cuda.get_device_properties(0)
+    if props.shared_memory_per_block_optin >= 128 * 1024:
+        pytest.skip("The non-cooperative path requires less than 128 KiB opt-in smem")
+
+    top_k = 512
+    seq_len = 35_000
+    num_rows = 4
+    set_random_seed(260919)
+    logits = torch.randn(num_rows, seq_len, dtype=torch.float32, device="cuda")
+    # Dense cutoff ties and signed-zero ties cover both nondeterministic atomic
+    # emission and the radix-key canonicalization fixed for Release 5.
+    logits[0].fill_(-1.0)
+    logits[0, : top_k + 128] = 1.0
+    logits[1].fill_(-1.0)
+    logits[1, 0 : 2 * top_k : 2] = 0.0
+    logits[1, 1 : 2 * top_k : 2] = -0.0
+    lengths = torch.full((num_rows,), seq_len, dtype=torch.int32, device="cuda")
+
+    reference = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
+    _run_topk_backend(
+        "persistent_topk", logits, lengths, reference, top_k, seq_len
+    )
+    torch.accelerator.synchronize()
+    expected_tie_indices = torch.arange(top_k, dtype=torch.int32, device="cuda")
+    torch.testing.assert_close(reference[0], expected_tie_indices, rtol=0, atol=0)
+    torch.testing.assert_close(reference[1], expected_tie_indices, rtol=0, atol=0)
+
+    for _ in range(20):
+        actual = torch.empty_like(reference)
+        _run_topk_backend(
+            "persistent_topk", logits, lengths, actual, top_k, seq_len
+        )
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")

@@ -458,6 +458,9 @@ class DeepseekV32Attention(MLAAttention):
                     self._vllm_config.parallel_config.cp_kv_cache_interleave_size
                 ),
                 skip_topk_buffer_clear=True,
+                topk_backend=(
+                    self._vllm_config.kernel_config.sparse_indexer_topk_backend
+                ),
             )
 
         attn_metadata, _, kv_cache, layer_slot_mapping = get_attention_context(

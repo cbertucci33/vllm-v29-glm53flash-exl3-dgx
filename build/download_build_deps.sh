@@ -19,6 +19,9 @@ fi
 packages=(
   "cmake==$CMAKE_VERSION"
   "wheel==$WHEEL_VERSION"
+  "setuptools==$SETUPTOOLS_VERSION"
+  "packaging==$PACKAGING_VERSION"
+  "apache-tvm-ffi==$APACHE_TVM_FFI_VERSION"
   "nvidia-cutlass-dsl==$NVIDIA_CUTLASS_DSL_VERSION"
   "nvidia-cutlass-dsl-libs-base==$NVIDIA_CUTLASS_DSL_VERSION"
   "nvidia-cutlass-dsl-libs-core==$NVIDIA_CUTLASS_DSL_VERSION"

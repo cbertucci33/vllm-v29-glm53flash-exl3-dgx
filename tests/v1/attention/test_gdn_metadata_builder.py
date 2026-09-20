@@ -21,6 +21,10 @@ from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionMetadata,
     GDNAttentionMetadataBuilder,
 )
+from vllm.v1.attention.backends.utils import (
+    NULL_BLOCK_ID,
+    mamba_get_block_table_tensor,
+)
 from vllm.v1.kv_cache_interface import MambaSpec
 
 BLOCK_SIZE = 16
@@ -221,3 +225,38 @@ def test_full_cudagraph_spec_metadata_uses_request_count():
     assert meta.spec_query_start_loc.shape == (batch.batch_size + 1,)
     assert meta.num_accepted_tokens is not None
     assert meta.num_accepted_tokens.shape == (batch.batch_size,)
+
+
+def test_decode_graph_stages_one_token_prefill_state():
+    """A shape-compatible stateless prefill must not reuse stale graph state."""
+    builder = _create_gdn_builder(full_cuda_graph=True)
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[100, 1, 0], query_lens=[1, 1, 0]),
+        BLOCK_SIZE,
+        DEVICE,
+    ).replace(
+        is_prefilling=torch.tensor([False, True, False]),
+        num_actual_tokens=3,
+    )
+    common.block_table_tensor[2].fill_(NULL_BLOCK_ID)
+    builder.non_spec_state_indices_tensor.fill_(42)
+
+    meta = builder.build(0, common)
+
+    assert meta.non_spec_state_indices_tensor is not None
+    assert (
+        meta.non_spec_state_indices_tensor.data_ptr()
+        == builder.non_spec_state_indices_tensor.data_ptr()
+    )
+    expected_state_indices = mamba_get_block_table_tensor(
+        common.block_table_tensor,
+        common.seq_lens,
+        builder.kv_cache_spec,
+        builder.vllm_config.cache_config.mamba_cache_mode,
+    )[:, 0]
+    torch.testing.assert_close(
+        meta.non_spec_state_indices_tensor,
+        expected_state_indices,
+    )
+    assert meta.non_spec_query_start_loc is not None
+    torch.testing.assert_close(meta.non_spec_query_start_loc, common.query_start_loc)

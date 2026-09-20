@@ -38,8 +38,27 @@ from vllm.v1.worker.utils import AttentionGroup
 logger = init_logger(__name__)
 
 
+def _get_profile_num_reqs(
+    num_reqs: int,
+    max_num_tokens: int,
+    num_query_per_req: int,
+) -> int:
+    profile_num_reqs = min(num_reqs, max_num_tokens // num_query_per_req)
+    if profile_num_reqs == 0:
+        raise ValueError(
+            "max_num_batched_tokens must be at least the speculator query "
+            f"length ({num_query_per_req}) for profiling."
+        )
+    return profile_num_reqs
+
+
 class DFlashSpeculator(DraftModelSpeculator):
     _speculator_name = "DFlash"  # For logging, so we can share methods with subclasses
+
+    def get_num_reqs_for_dummy_run(self, num_reqs: int) -> int:
+        return _get_profile_num_reqs(
+            num_reqs, self.max_num_tokens, self.num_query_per_req
+        )
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
@@ -374,6 +393,21 @@ class DFlashSpeculator(DraftModelSpeculator):
         num_reqs = input_batch.num_reqs
         num_target_tokens = input_batch.num_tokens
         num_query_tokens = num_reqs * self.num_query_per_req
+        profile_num_reqs = num_reqs
+        profile_num_query_tokens = num_query_tokens
+        if num_query_tokens > self.max_num_tokens:
+            if dummy_run and skip_attn_for_dummy_run:
+                profile_num_reqs = _get_profile_num_reqs(
+                    num_reqs, self.max_num_tokens, self.num_query_per_req
+                )
+                profile_num_query_tokens = profile_num_reqs * self.num_query_per_req
+            else:
+                raise ValueError(
+                    "Speculative decoding query batch exceeds max_num_batched_tokens: "
+                    f"{num_reqs} requests with query length "
+                    f"{self.num_query_per_req} need {num_query_tokens} tokens, "
+                    f"but only {self.max_num_tokens} are available."
+                )
         max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
         self.draft_max_seq_len = min(
             max_seq_len + self.num_query_per_req, self.max_model_len
@@ -399,12 +433,10 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.hidden_states[:num_target_tokens],
                 self.context_positions[:num_target_tokens],
             )
-            # DFlash processes all speculative tokens in one forward pass,
-            # so the real token count is num_query_tokens.
-            self._prepare_eplb_forward(num_query_tokens)
+            self._prepare_eplb_forward(profile_num_query_tokens)
             self._generate_draft(
-                num_reqs,
-                num_query_tokens,
+                profile_num_reqs,
+                profile_num_query_tokens,
                 attn_metadata=None,
                 slot_mappings=None,
                 num_tokens_across_dp=(
@@ -425,6 +457,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                     input_batch.seq_lens,
                     self.block_tables.kernel_block_sizes[gid],
                     ring_size,
+                    self.num_query_per_req,
                 )
         # Support multiple draft KV cache groups by preparing inputs once for each
         for i, gid in enumerate(self.draft_kv_cache_group_ids):
@@ -538,12 +571,18 @@ def _synthesize_draft_ring_block_tables_kernel(
     seq_lens_ptr,
     block_size,
     ring_size,
+    num_query_per_req,
     BLOCK_SIZE: tl.constexpr,
 ):
     batch_idx = tl.program_id(0)
     req_state_idx = tl.load(idx_mapping_ptr + batch_idx)
     seq_len = tl.load(seq_lens_ptr + batch_idx)
-    num_blocks = (seq_len + block_size - 1) // block_size
+    # The draft forward appends the bonus + mask queries immediately after
+    # ``seq_len`` and writes their KV through this same table. Expose the
+    # possible next logical block as well; otherwise a sequence at (or within
+    # the query width of) a block boundary resolves those query slots to the
+    # null block. The private ring is sized with one extra page for this.
+    num_blocks = (seq_len + num_query_per_req + block_size - 1) // block_size
     row_ptr = block_table_ptr + batch_idx.to(tl.int64) * block_table_stride
     base = 1 + req_state_idx * ring_size
     for start in tl.range(0, block_table_stride, BLOCK_SIZE):
@@ -559,8 +598,9 @@ def synthesize_draft_ring_block_tables(
     seq_lens: torch.Tensor,
     block_size: int,
     ring_size: int,
+    num_query_per_req: int,
 ) -> None:
-    """Build a draft block table directly from the request-local ring."""
+    """Build a draft block table covering context and the next draft queries."""
     _synthesize_draft_ring_block_tables_kernel[(idx_mapping.shape[0],)](
         block_table,
         block_table.stride(0),
@@ -568,6 +608,7 @@ def synthesize_draft_ring_block_tables(
         seq_lens,
         block_size,
         ring_size,
+        num_query_per_req,
         BLOCK_SIZE=256,  # type: ignore
     )
 

@@ -14,6 +14,7 @@ from vllm.v1.core.kv_cache_coordinator import SpecGroup
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     KVCacheBlock,
+    get_draft_replay_reserve,
 )
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -74,6 +75,7 @@ class MooncakeStoreCoordinator:
         use_eagle: bool = False,
         retention_interval: int | None = None,
         dcp_world_size: int = 1,
+        draft_replay_reserve: int | None = None,
     ) -> None:
         # Mirrors core's resolve_kv_cache_block_sizes: the hash unit only has
         # to divide groups that participate in prefix caching. Non-shareable
@@ -103,6 +105,9 @@ class MooncakeStoreCoordinator:
         self.enable_partial_hash_hits = partial_hash_hits_enabled(
             kv_cache_groups, hash_block_size, dcp_world_size
         )
+        if draft_replay_reserve is None:
+            draft_replay_reserve = get_draft_replay_reserve(kv_cache_groups)
+        self.draft_replay_reserve = draft_replay_reserve
         self.use_eagle = use_eagle
         # Mirror vLLM core's KVCacheCoordinator.retention_interval.
         self.retention_interval = retention_interval
@@ -137,12 +142,18 @@ class MooncakeStoreCoordinator:
                 if group.spec == spec:
                     assert manager_cls is group.manager_cls
                     group.group_ids.append(i)
-                    if g.is_eagle_group and not group.use_eagle:
+                    group_uses_eagle_drop = self.use_eagle and g.is_eagle_group
+                    if group_uses_eagle_drop and not group.use_eagle:
                         attention_groups[idx] = group._replace(use_eagle=True)
                     break
             else:
                 attention_groups.append(
-                    SpecGroup(spec, [i], manager_cls, g.is_eagle_group)
+                    SpecGroup(
+                        spec,
+                        [i],
+                        manager_cls,
+                        self.use_eagle and g.is_eagle_group,
+                    )
                 )
         # Full attention first (matches upstream convergence ordering).
         attention_groups.sort(key=lambda g: not isinstance(g.spec, FullAttentionSpec))

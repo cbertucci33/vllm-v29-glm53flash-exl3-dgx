@@ -699,6 +699,28 @@ def dcp_world_size_for_kv_cache_spec(spec: KVCacheSpec, dcp_world_size: int) -> 
     return 1
 
 
+def get_draft_replay_reserve(kv_cache_groups: Sequence[KVCacheGroupSpec]) -> int:
+    """Return target tokens that must be replayed to rebuild private draft KV."""
+    return max(
+        (
+            group.kv_cache_spec.sliding_window
+            for group in kv_cache_groups
+            if type(group.kv_cache_spec) is DFlashSWASpec
+        ),
+        default=0,
+    )
+
+
+def get_draft_replay_boundary(
+    num_prompt_tokens: int,
+    draft_replay_reserve: int,
+    scheduler_block_size: int,
+) -> int:
+    """Return the last restorable target-state boundary for a draft window."""
+    max_replay = max(num_prompt_tokens - 1 - draft_replay_reserve, 0)
+    return max_replay // scheduler_block_size * scheduler_block_size
+
+
 def resolve_kv_cache_block_sizes(
     kv_cache_config: KVCacheConfig,
     vllm_config: VllmConfig,
@@ -1061,19 +1083,41 @@ def get_max_concurrency_for_kv_cache_config(
     DFlash rings are allocated outside that pool and therefore contribute no
     shared blocks here, matching DFlashRingManager's runtime ownership.
     """
-    num_blocks_per_request = sum(
-        cdiv(
-            group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
-            group.kv_cache_spec.page_size_bytes,
+    num_blocks_per_request = 0
+    scratch_blocks_per_request = 0
+    for group in kv_cache_config.kv_cache_groups:
+        spec = group.kv_cache_spec
+        if type(spec) is DFlashSWASpec and cast(DFlashSWASpec, spec).private_ring:
+            continue
+        required = cdiv(spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes)
+        scratch = min(
+            cdiv(spec.speculative_scratch_bytes(vllm_config), spec.page_size_bytes),
+            required,
         )
-        for group in kv_cache_config.kv_cache_groups
-        if not (
-            type(group.kv_cache_spec) is DFlashSWASpec
-            and cast(DFlashSWASpec, group.kv_cache_spec).private_ring
-        )
+        num_blocks_per_request += required
+        scratch_blocks_per_request += scratch
+    return _pool_concurrency_limit(
+        kv_cache_config.num_blocks,
+        num_blocks_per_request,
+        scratch_blocks_per_request,
+        vllm_config.scheduler_config.max_num_seqs,
     )
-    max_concurrency = kv_cache_config.num_blocks / num_blocks_per_request
-    return max_concurrency
+
+
+def _pool_concurrency_limit(
+    num_blocks: int,
+    blocks_per_request: int,
+    scratch_blocks_per_request: int,
+    max_num_seqs: int,
+) -> float:
+    resident_blocks_per_request = blocks_per_request - scratch_blocks_per_request
+    if scratch_blocks_per_request <= 0 or resident_blocks_per_request <= 0:
+        return num_blocks / blocks_per_request
+    all_running = num_blocks / blocks_per_request
+    if all_running <= max_num_seqs:
+        return all_running
+    usable_blocks = num_blocks - max_num_seqs * scratch_blocks_per_request
+    return usable_blocks / resident_blocks_per_request
 
 
 def may_override_num_blocks(vllm_config: VllmConfig, num_blocks: int) -> int:
@@ -2300,7 +2344,7 @@ def _warn_if_unannotated_eagle_mamba(
         kv_cache_groups: Groups as they will be handed to consumers.
     """
     spec_config = vllm_config.speculative_config
-    if spec_config is None or not spec_config.use_eagle():
+    if spec_config is None or not spec_config.use_eagle_block_drop():
         return
     if any(group.is_eagle_group for group in kv_cache_groups):
         return
@@ -2668,6 +2712,11 @@ def _project_kv_cache_groups_to_worker(
                 worker_layer_names,
                 group_spec,
                 is_eagle_group=group.is_eagle_group and bool(worker_layer_names),
+                # Preserve the global ownership contract. In particular,
+                # DFlash's private draft ring must not become externally
+                # transferable merely because groups were projected onto a
+                # pipeline worker.
+                enable_kv_transfer=group.enable_kv_transfer,
             )
         )
     return projected_groups

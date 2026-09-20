@@ -656,11 +656,13 @@ class MLAAttention(nn.Module, AttentionLayerBase):
     @property
     def chunked_prefill_workspace_size(self) -> int:
         if self._chunked_prefill_workspace_size is None:
-            self._chunked_prefill_workspace_size = (
-                MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size(
-                    self._vllm_config
-                )
+            builder_cls = self.attn_backend.get_builder_cls()
+            determine = getattr(
+                builder_cls,
+                "determine_chunked_prefill_workspace_size",
+                MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size,
             )
+            self._chunked_prefill_workspace_size = determine(self._vllm_config)
         return self._chunked_prefill_workspace_size
 
     def forward(

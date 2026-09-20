@@ -87,12 +87,22 @@ def _split(
     partial_hit: bool = False,
     num_prefill_checkpoint_blocks: int = 0,
     dflash_skip_backoff: bool = False,
+    draft_replay_reserve: int = 0,
 ) -> int:
     """Call the real `Scheduler._mamba_block_aligned_split` on a stub self."""
+    block_drop = use_eagle and not dflash_skip_backoff
+
+    def get_replay_boundary(req: Request) -> int:
+        max_replay = max(
+            req.num_prompt_tokens - 1 - draft_replay_reserve,
+            0,
+        )
+        return max_replay // MAMBA_BLOCK_SIZE * MAMBA_BLOCK_SIZE
+
     stub = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=MAMBA_BLOCK_SIZE),
         use_eagle=use_eagle,
-        use_eagle_block_drop=use_eagle and not dflash_skip_backoff,
+        use_eagle_block_drop=block_drop,
         max_num_scheduled_tokens=16384,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
         # `prefix_match_unit` finer than the block size (#46384).
@@ -102,7 +112,8 @@ def _split(
         mamba_has_prefill_checkpoint_blocks=(
             num_prefill_checkpoint_blocks > 0 and not use_eagle
         ),
-        mamba_eagle_skip_backoff=dflash_skip_backoff,
+        draft_replay_reserve=draft_replay_reserve,
+        kv_cache_manager=SimpleNamespace(get_replay_boundary=get_replay_boundary),
     )
     return Scheduler._mamba_block_aligned_split(stub, request, num_new_tokens)
 
@@ -154,6 +165,28 @@ def test_dflash_does_not_shift_partial_tail_boundary() -> None:
     assert without_drop == MAMBA_BLOCK_SIZE
     expected_eagle_tail = PROMPT_LEN // ATTN_BLOCK_SIZE * ATTN_BLOCK_SIZE
     assert with_drop == expected_eagle_tail - ATTN_BLOCK_SIZE
+
+
+def test_dflash_replay_boundary_is_a_real_chunk_end() -> None:
+    """The future cache-hit cap must name state written by this producer."""
+    prompt_len = 92377
+    replay_reserve = 2048
+    start = 78336
+    (request,) = create_requests(1, num_tokens=prompt_len, block_size=ATTN_BLOCK_SIZE)
+    request.num_computed_tokens = start
+
+    scheduled = _split(
+        request,
+        prompt_len - start,
+        dflash_skip_backoff=True,
+        draft_replay_reserve=replay_reserve,
+    )
+    replay_boundary = (
+        (prompt_len - 1 - replay_reserve)
+        // MAMBA_BLOCK_SIZE
+        * MAMBA_BLOCK_SIZE
+    )
+    assert start + scheduled == replay_boundary
 
 
 @pytest.mark.parametrize(

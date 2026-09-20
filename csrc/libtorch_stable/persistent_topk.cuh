@@ -49,6 +49,9 @@ constexpr size_t kFixedSmemLarge =
 
 __device__ __forceinline__ auto convert_to_uint32_v2(float x) -> uint32_t {
   uint32_t bits = __float_as_uint(x);
+  // Numeric ties must have one key. Without canonicalization +0.0 and -0.0
+  // select different radix bins and violate deterministic index tie-breaking.
+  if ((bits & 0x7FFFFFFFu) == 0u) bits = 0u;
   return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
 }
 
@@ -429,7 +432,7 @@ __device__ __noinline__ void histogram_256_topk(
     const float* __restrict__ logits, int* __restrict__ output_indices,
     int logits_offset, int seq_len) {
   // All shared state lives in dynamic shared memory to avoid static
-  extern __shared__ char medium_smem[];
+  extern __shared__ __align__(16) char medium_smem[];
 
   int (*shared_histogram)[RADIX + 128] =
       reinterpret_cast<int (*)[RADIX + 128]>(medium_smem);
@@ -602,21 +605,20 @@ __device__ __noinline__ void histogram_256_topk(
 // yielding an approximate top-k. This variant never buffers: every radix round
 // and the final collection re-stream the row from global, filtered by the
 // accumulated prefix, so the result is EXACT (bit-identical value multiset to a
-// full top-k; ties at the exact pivot value are broken arbitrarily, matching
-// the cooperative radix path's contract). Fixed ~3 KB smem, no per-row cap.
-// Used for the force_noncooperative (<128 KB smem, e.g. GB10) long-context path
-// where the multi-CTA cooperative radix cannot fit its co-resident barrier.
+// full top-k). Fixed ~3 KB selection smem, no per-row cap.
+// Used for the force_noncooperative (<128 KB smem, e.g. GB10) path where the
+// multi-CTA cooperative radix cannot fit its co-resident barrier. Selection and
+// emission are deterministic: values descend, ties resolve by index ascending,
+// and the resulting selected indices are emitted in ascending source order.
 template <int TopK>
 __device__ __noinline__ void histogram_streaming_topk(
     const float* __restrict__ logits, int* __restrict__ output_indices,
     int logits_offset, int seq_len) {
-  extern __shared__ char medium_smem[];
+  extern __shared__ __align__(16) char medium_smem[];
   int (*hist)[RADIX + 128] =
       reinterpret_cast<int (*)[RADIX + 128]>(medium_smem);
   int* scalars = reinterpret_cast<int*>(medium_smem + kMediumHistBytes);
   int& shared_threshold_bin = scalars[0];
-  int& shared_output_count = scalars[1];
-  int& shared_final_k = scalars[2];
 
   const int tid = threadIdx.x;
   uint32_t prefix = 0u;   // high bits of the pivot key pinned so far
@@ -670,36 +672,64 @@ __device__ __noinline__ void histogram_streaming_topk(
     __syncthreads();
   }
 
-  // prefix == exact 32-bit pivot key; remaining_k == #elements equal to the
-  // pivot to emit (>= 1). Stream once more to collect (no buffer).
-  if (tid == 0) {
-    shared_output_count = 0;
-    shared_final_k = remaining_k;
-  }
-  __syncthreads();
+  // prefix == exact 32-bit pivot key; remaining_k is the number of pivot ties
+  // to keep. Emit directly into final index order. Atomic output positions made
+  // the previous result depend on warp arrival order and could even change the
+  // selected set at a dense pivot tie (vllm#54521).
+  using ScanT = cub::BlockScan<uint32_t, kThreadsPerBlock>;
+  auto* scan_tmp = reinterpret_cast<typename ScanT::TempStorage*>(medium_smem);
+  constexpr int kItems = 4;
+  constexpr int kTile = kItems * kThreadsPerBlock;
+  static_assert(kTile <= 0xFFFF,
+                "packed deterministic emission counts must fit in 16 bits");
 
-  // (1) elements strictly greater than the pivot -- all in the top-k.
-  for (int idx = tid; idx < seq_len; idx += kThreadsPerBlock) {
-    const uint32_t key = convert_to_uint32_v2(logits[idx + logits_offset]);
-    if (key > prefix) {
-      const int pos = atomicAdd(&shared_output_count, 1);
-      if (pos < TopK) output_indices[pos] = idx;
+  uint32_t run_gt = 0;
+  uint32_t run_eq = 0;
+  for (int base = 0; base < seq_len; base += kTile) {
+    const int mine = base + tid * kItems;
+    uint32_t keys[kItems];
+    bool valid[kItems];
+#pragma unroll
+    for (int j = 0; j < kItems; ++j) {
+      const int idx = mine + j;
+      valid[j] = idx < seq_len;
+      keys[j] = valid[j]
+                    ? convert_to_uint32_v2(logits[idx + logits_offset])
+                    : 0u;
     }
-  }
-  __syncthreads();
 
-  // (2) elements equal to the pivot, capped at remaining_k (arbitrary ties).
-  for (int idx = tid; idx < seq_len; idx += kThreadsPerBlock) {
-    const uint32_t key = convert_to_uint32_v2(logits[idx + logits_offset]);
-    if (key == prefix) {
-      const int slot = atomicAdd(&shared_final_k, -1);
-      if (slot > 0) {
-        const int pos = atomicAdd(&shared_output_count, 1);
-        if (pos < TopK) output_indices[pos] = idx;
+    uint32_t is_gt[kItems];
+    uint32_t is_eq[kItems];
+    uint32_t packed = 0;
+#pragma unroll
+    for (int j = 0; j < kItems; ++j) {
+      is_gt[j] = valid[j] && keys[j] > prefix;
+      is_eq[j] = valid[j] && keys[j] == prefix;
+      packed += is_gt[j] | (is_eq[j] << 16);
+    }
+
+    uint32_t packed_rank;
+    uint32_t packed_total;
+    ScanT(*scan_tmp).ExclusiveSum(packed, packed_rank, packed_total);
+    uint32_t greater_before = run_gt + (packed_rank & 0xFFFFu);
+    uint32_t equal_before = run_eq + (packed_rank >> 16);
+#pragma unroll
+    for (int j = 0; j < kItems; ++j) {
+      if (is_gt[j] || (is_eq[j] && equal_before < remaining_k)) {
+        const uint32_t kept_equal_before =
+            equal_before < static_cast<uint32_t>(remaining_k)
+                ? equal_before
+                : static_cast<uint32_t>(remaining_k);
+        const uint32_t pos = greater_before + kept_equal_before;
+        if (pos < static_cast<uint32_t>(TopK)) output_indices[pos] = mine + j;
       }
+      greater_before += is_gt[j];
+      equal_before += is_eq[j];
     }
+    run_gt += packed_total & 0xFFFFu;
+    run_eq += packed_total >> 16;
+    __syncthreads();
   }
-  __syncthreads();
 }
 
 // ============================================================================
@@ -1051,6 +1081,11 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
                i += kThreadsPerBlock) {
             row_output[i] = (i < seq_len) ? static_cast<int32_t>(i) : -1;
           }
+        } else if (params.force_noncooperative) {
+          // GB10/consumer Blackwell: use the exact deterministic selector for
+          // every non-trivial row. The specialized histogram emitters assign
+          // output slots by atomic arrival order and are not replay-stable.
+          histogram_streaming_topk<TopK>(row_input, row_output, 0, seq_len);
         } else if (seq_len <= static_cast<uint32_t>(HIST2048_THRESHOLD)) {
           histogram_2048_topk<TopK>(row_input, row_output, seq_len);
         } else if (seq_len <= RADIX_THRESHOLD) {

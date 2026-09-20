@@ -1292,7 +1292,12 @@ def test_project_kv_cache_groups_to_worker():
     spec_b = new_kv_cache_spec(num_kv_heads=4)
 
     global_groups = [
-        KVCacheGroupSpec(["layer1", "layer2", "layer3"], spec_a),
+        KVCacheGroupSpec(
+            ["layer1", "layer2", "layer3"],
+            spec_a,
+            is_eagle_group=True,
+            enable_kv_transfer=False,
+        ),
     ]
     worker_spec = {"layer1": spec_a, "layer2": spec_a}
     projected = kv_cache_utils._project_kv_cache_groups_to_worker(
@@ -1301,6 +1306,8 @@ def test_project_kv_cache_groups_to_worker():
     assert len(projected) == 1
     assert projected[0].layer_names == ["layer1", "layer2"]
     assert projected[0].kv_cache_spec is spec_a
+    assert projected[0].is_eagle_group
+    assert not projected[0].enable_kv_transfer
 
     projected = kv_cache_utils._project_kv_cache_groups_to_worker(
         global_groups, {"layer4": spec_a}
@@ -1308,6 +1315,8 @@ def test_project_kv_cache_groups_to_worker():
     assert len(projected) == 1
     assert projected[0].layer_names == []
     assert projected[0].kv_cache_spec is spec_a
+    assert not projected[0].is_eagle_group
+    assert not projected[0].enable_kv_transfer
 
     uniform_spec = UniformTypeKVCacheSpecs(
         block_size=16,

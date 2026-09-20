@@ -206,6 +206,13 @@ LinearBackend = Literal[
     "xpu_woq",
 ]
 
+SparseIndexerTopkBackend = Literal[
+    "auto",
+    "cooperative",
+    "persistent",
+    "per_row",
+]
+
 
 @config
 class KernelConfig:
@@ -295,6 +302,14 @@ class KernelConfig:
     - "xpu_woq": Use XPU kernels for weight-only quantization (e.g. W8A16)
     """
 
+    sparse_indexer_topk_backend: SparseIndexerTopkBackend = "auto"
+    """Backend for NVIDIA sparse-indexer decode top-k.
+
+    ``auto`` selects cooperative top-k only where its architecture and row-count
+    constraints are satisfied, then persistent top-k, then the per-row kernel.
+    Explicit selections fail closed when their native constraints are not met.
+    """
+
     @field_validator("moe_backend", mode="before")
     @classmethod
     def _normalize_moe_backend(cls, value: Any) -> Any:
@@ -305,6 +320,13 @@ class KernelConfig:
     @field_validator("linear_backend", mode="before")
     @classmethod
     def _normalize_linear_backend(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.lower().replace("-", "_")
+        return value
+
+    @field_validator("sparse_indexer_topk_backend", mode="before")
+    @classmethod
+    def _normalize_sparse_indexer_topk_backend(cls, value: Any) -> Any:
         if isinstance(value, str):
             return value.lower().replace("-", "_")
         return value

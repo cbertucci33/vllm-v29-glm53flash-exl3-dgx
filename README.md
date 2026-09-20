@@ -15,16 +15,20 @@ The qualified deployment uses two NVIDIA DGX Spark systems with tensor
 parallelism across the ConnectX fabric. Both ranks must use the same image,
 source revision, rank-sliced checkpoint, DFlash checkpoint, and runtime flags.
 
-1. Check out the release and prepare the pinned build inputs:
+1. Clone the source release and download the qualified models:
 
    ```bash
-   git checkout v4.0.0
+   git clone --branch v5.0.0 --single-branch \
+     https://github.com/cbertucci33/vllm-v29-glm53flash-exl3-dgx.git
+   cd vllm-v29-glm53flash-exl3-dgx
+   build/download_models.sh /srv/glm53/models
    ```
 
-   Follow [`build/README.md`](build/README.md) to verify the pinned sources,
-   build the native artifacts, and create the final image context.
+   Follow [`build/README.md`](build/README.md) to fetch every pinned source,
+   build the native artifacts, and create the final image.
 
-2. Inspect and create a two-way rank-sliced checkpoint:
+2. The downloaded target model is already rank-sliced for TP2. To use another
+   compatible GLM-5.3 Flash EXL3 checkpoint, inspect and slice it first:
 
    ```bash
    python3 tools/slice_exl3_checkpoint.py \
@@ -53,6 +57,35 @@ source revision, rank-sliced checkpoint, DFlash checkpoint, and runtime flags.
 
 These results come from one two-node DGX Spark deployment. They are operational
 measurements, not hardware limits or broad benchmark claims.
+
+### Release 5 production throughput
+
+Release 5 improves high-throughput decoding while preserving the cached-prefix
+latency established by the preceding releases. The table compares active
+approximately 10-second generation intervals from the original Release 1
+deployment with the final Release 5 deployment.
+
+| Measurement | Release 1 | Release 5 | Change |
+| --- | ---: | ---: | ---: |
+| Mean generation throughput | 22.6 tokens/s | 23.7 tokens/s | +5% |
+| P90 generation throughput | 36.3 tokens/s | 43.8 tokens/s | +21% |
+
+Release 5 recorded a standalone observed peak of **65.8 tokens/s**. Its 296
+active intervals had a median of 20.8 tokens/s. Median DFlash acceptance was
+28.0%, median useful span was 2.96 tokens per verification step, and the P90
+useful span was 5.78 tokens.
+
+The Release 1 values were reconstructed from archived two-second cumulative
+token counters. Five possible sampling phases produced means from 22.62 to
+22.64 tokens/s and P90 values from 36.07 to 36.48 tokens/s. The table reports
+the rounded central values. The original Release 1 vLLM interval logs were not
+retained, so no Release 1 peak is reported. Release 5 values come from the
+native vLLM interval logger. These are production observations with different
+workloads, not a controlled hardware benchmark.
+
+Release 5 also passed a production-path cached-prefix check: a 32,025-token
+continuation reused 27,648 cached tokens and completed in 2.886 seconds. Both
+tensor-parallel ranks remained up with zero restarts during acceptance.
 
 ### Release 4 production sample
 
@@ -100,6 +133,41 @@ with DFlash2 configured for seven proposals and a 971,162-token cache.
 
 Both requests returned HTTP 200. Both ranks remained up with zero restarts or
 post-start errors. The accepted runtime source ends at commit `73c0212232`.
+
+## Release 5
+
+Release 5 repairs long-prefix DFlash state ownership and makes the GB10 TopK
+path deterministic. It retains the GLM, EXL3, sparse MLA, B12X, FP8 KV,
+DFlash2, tool-use, reasoning, and multimodal features from earlier releases.
+The runtime source ends at commit `10b33ab40e`.
+
+Changes in this release:
+
+- materialized the exact DFlash replay boundary before publishing recurrent
+  state, so a later request cannot restore a logical checkpoint that was never
+  written by a forward pass;
+- separated DFlash draft-group identity from EAGLE and MTP target-cache tail
+  dropping across the scheduler and hybrid cache coordinator;
+- applied the DFlash replay reserve consistently to local prefix caching,
+  NIXL, Mooncake, generic KV offload, and CPU offload restore paths;
+- kept the private DFlash history ring out of external cache transfer while
+  preserving original target cache-group identities through projected worker
+  and connector layouts;
+- preserved replay capability fields when cache groups are rebuilt for
+  pipeline workers and external connectors;
+- added copy-on-write ownership for every published Mamba, KDA, and
+  convolution snapshot before a producer or cache-hit consumer mutates the
+  underlying state page;
+- replaced atomic arrival-order emission in the GB10 persistent TopK kernel
+  with deterministic index-ranked selection, including lowest-index tie
+  handling and signed-zero normalization; and
+- kept unsupported cooperative TopK paths fail-closed on GB10.
+
+Focused verification covered producer and consumer copy-on-write ownership,
+completion, abort, preemption, eviction, request reuse, connector projection,
+exact replay boundaries, and deterministic TopK at the production 35K-row,
+512-selection geometry. The final two-rank deployment passed cached-prefix and
+forced-tool-call acceptance with DFlash2 configured for seven proposals.
 
 ## Release 4
 
@@ -254,11 +322,15 @@ The static interface review is in [`docs/static-contract-review.md`](docs/static
 | FlashInfer spdlog | `c3aed4b68373955e1cc94307683d44dca1515d2b` |
 | Sparkinfer (now `local-inference-lab/b12x`) | [`d4438d490691f79022fdfc8149e1c5f161d15445`](https://github.com/local-inference-lab/b12x/commit/d4438d490691f79022fdfc8149e1c5f161d15445) |
 | ExLlamaV3 | `c5d9c657966ffeeaa9353f0cc899f18629da4a13`, format `0.0.43` |
-| B12X dense-kernel package (`lukealonso/b12x`) | `1.2.6`, commit `ab6eea89b5b5e334ac6e9f2c503c1de60c3f216c` |
+| B12X dense-kernel package (`local-inference-lab/b12x`) | `1.2.6`, commit `ab6eea89b5b5e334ac6e9f2c503c1de60c3f216c` |
 | NVIDIA CUTLASS DSL | `4.7.0` |
 | GLM chat template | Z.ai revision `690b705278a3a58e538fcb37c2ca8b5f9511213c` |
+| Qualified target model | [`cbert33/GLM-5.3-Flash-Uncensored-EXL3-DGX-Sliced`](https://huggingface.co/cbert33/GLM-5.3-Flash-Uncensored-EXL3-DGX-Sliced), revision `43fe4b2aba293c2df3b413f63d926aa1a0725d26` |
+| DFlash2 model | [`local-inference-lab/GLM-5.3-Flash-DFlash2`](https://huggingface.co/local-inference-lab/GLM-5.3-Flash-DFlash2), revision `713226ab03bc38afdf955c7450436c2f7176f6f8` |
 
-External sources and wheels are downloaded during build preparation. They are not vendored here.
+The build scripts fetch every external source, build the custom FlashInfer
+wheel, and download both model repositories. These artifacts are not vendored
+here.
 
 ## Prepare a tensor-parallel checkpoint
 

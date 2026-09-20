@@ -171,7 +171,7 @@ def test_selector_asks_for_fp32_proposal_logits():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_ring_synthesis_ignores_scheduler_placeholders():
+def test_ring_synthesis_covers_context_and_draft_queries():
     from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
         synthesize_draft_ring_block_tables,
     )
@@ -185,14 +185,19 @@ def test_ring_synthesis_ignores_scheduler_placeholders():
     idx_mapping = torch.tensor([3, 1], dtype=torch.int32, device="cuda")
     seq_lens = torch.tensor([20, 12], dtype=torch.int32, device="cuda")
     synthesize_draft_ring_block_tables(
-        block_table, idx_mapping, seq_lens, block_size=4, ring_size=ring_size
+        block_table,
+        idx_mapping,
+        seq_lens,
+        block_size=4,
+        ring_size=ring_size,
+        num_query_per_req=5,
     )
 
     base0, base1 = 1 + 3 * ring_size, 1 + ring_size
     expected = torch.tensor(
         [
-            [base0, base0 + 1, base0 + 2, base0 + 3, base0, 0, 0],
-            [base1, base1 + 1, base1 + 2, 0, 0, 0, 0],
+            [base0, base0 + 1, base0 + 2, base0 + 3, base0, base0 + 1, base0 + 2],
+            [base1, base1 + 1, base1 + 2, base1 + 3, base1, 0, 0],
         ],
         dtype=torch.int32,
         device="cuda",

@@ -3,7 +3,7 @@
 
 import torch
 
-from vllm.v1.worker.utils import bind_kv_cache
+from vllm.v1.worker.utils import bind_kv_cache, zero_null_kv_block
 
 
 def test_bind_kv_cache(default_vllm_config):
@@ -90,3 +90,24 @@ def test_bind_kv_cache_draft_model(default_vllm_config):
     assert runner_kv_caches[1] is kv_cache["draft_model.layers.0.attn"]
     assert runner_kv_caches[2] is kv_cache["model.layers.1.attn"]
     assert runner_kv_caches[3] is kv_cache["draft_model.layers.1.attn"]
+
+
+def test_zero_null_kv_block_clears_only_block_zero():
+    cache = torch.arange(24, dtype=torch.float32).reshape(4, 2, 3)
+    cache[0] = torch.tensor([[float("nan"), 3.2e35, 0.0], [float("nan")] * 3])
+    untouched = cache[1:].clone()
+
+    zero_null_kv_block([cache])
+
+    assert torch.all(cache[0] == 0)
+    assert torch.equal(cache[1:], untouched)
+
+
+def test_zero_null_kv_block_skips_empty_caches():
+    empty = torch.empty(0)
+    no_blocks = torch.empty(0, 4)
+
+    zero_null_kv_block([empty, no_blocks])
+
+    assert empty.numel() == 0
+    assert no_blocks.shape == (0, 4)

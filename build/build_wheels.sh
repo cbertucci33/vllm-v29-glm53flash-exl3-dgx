@@ -27,11 +27,12 @@ tar -xzf "$source_dir"/b12x-*.tar.gz -C "$work_dir"
 (cd "$work_dir/exllamav3" && patch -p1 < "$source_dir/exllamav3-aarch64.patch")
 (cd "$work_dir/b12x" && patch -p1 < "$source_dir/b12x-cutlass-dsl.patch")
 
-actual_flashinfer_sha=$(sha256sum "$flashinfer_wheel" | awk '{print $1}')
-if [[ $actual_flashinfer_sha != "$FLASHINFER_WHEEL_SHA256" ]]; then
-  echo "FlashInfer wheel hash mismatch" >&2
+flashinfer_manifest=$(dirname "$flashinfer_wheel")/flashinfer-wheel.sha256
+if [[ ! -f $flashinfer_manifest ]]; then
+  echo "FlashInfer wheel manifest is missing: $flashinfer_manifest" >&2
   exit 1
 fi
+(cd "$(dirname "$flashinfer_wheel")" && sha256sum -c flashinfer-wheel.sha256)
 (cd "$build_deps_dir" && sha256sum -c build-deps-sha256.txt)
 
 export TORCH_CUDA_ARCH_LIST FLASHINFER_CUDA_ARCH_LIST MAX_JOBS NVCC_THREADS

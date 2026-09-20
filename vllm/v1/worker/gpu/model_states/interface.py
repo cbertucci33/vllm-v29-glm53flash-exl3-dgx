@@ -126,6 +126,10 @@ class ModelState(ABC):
     def apply_staged_writes(self) -> None:
         return None
 
+    def set_kv_cache_config(self, kv_cache_config: KVCacheConfig) -> None:
+        """Bind the finalized KV-cache layout before requests are admitted."""
+        return None
+
     def get_additional_cg_support(self) -> tuple[AttentionCGSupport, str | None]:
         """Cudagraph support of attention groups this ModelState builds outside
         ``init_attn_backend`` (e.g. encoder-only layers).

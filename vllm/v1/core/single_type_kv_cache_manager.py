@@ -96,8 +96,13 @@ class SingleTypeKVCacheManager(ABC):
         # consume them and this manager holds a spec type that gets zeroed.
         self._record_new_block_ids = (
             needs_kv_cache_zeroing
-            and isinstance(kv_cache_spec, AttentionSpec)
-            and not isinstance(kv_cache_spec, CircularBufferSpec)
+            and (
+                (
+                    isinstance(kv_cache_spec, AttentionSpec)
+                    and not isinstance(kv_cache_spec, CircularBufferSpec)
+                )
+                or isinstance(kv_cache_spec, MambaSpec)
+            )
         )
         self.new_block_ids: list[int] = []
 
@@ -1524,16 +1529,30 @@ class MambaManager(SingleTypeKVCacheManager):
             # Mapping from request ID to the index of the block
             # allocated in the previous step
             self.last_state_block_idx: dict[str, int] = {}
+            # Align-mode prefill leaves null gaps between sparse state pages.
+            # Track the retired prefix explicitly so later retirement ranges
+            # cross those gaps instead of stopping at the first null page.
+            self._num_retired_blocks: dict[str, int] = {}
             # The set of the requests that have been allocated blocks
             self._allocated_block_reqs: set[str] = set()
             # Checkpoint position and reserved block index for the current
             # allocation.
             self._checkpoints: dict[str, tuple[int, int]] = {}
             # Requests that registered their own last-prompt-boundary partial
-            # tail (producers). On the next step's CoW the boundary state moves
-            # into a private cow_block; we record that block for connector
-            # offload (see _pending_boundary_state_offloads).
-            self._producer_partial_tail_reqs: dict[str, int] = {}
+            # tail or aligned full boundary (producers). On the next step's CoW
+            # the published boundary state moves into a private cow_block; we
+            # record that block for connector offload (see
+            # _pending_boundary_state_offloads).
+            self._producer_boundary_state_reqs: dict[str, int] = {}
+            # A full aligned Mamba state is both a prefix-cache snapshot and the
+            # mutable initial state for the next continuation. Keep the running
+            # request on its append-only source slot, but move the published
+            # hash and bytes to a private CoW block before that source is
+            # overwritten. New requests restoring an aligned hit likewise need
+            # a private mutable copy before their first forward.
+            self._aligned_state_cow_reqs: dict[
+                str, tuple[int, KVCacheBlock]
+            ] = {}
             # Hash-cached boundary-state blocks freed while the request was
             # still running, re-aged at retirement so they are not the pool's
             # first eviction candidates (entries: block, hash, prefix tokens).
@@ -1704,11 +1723,40 @@ class MambaManager(SingleTypeKVCacheManager):
                 < cdiv(processed_computed_tokens, self.block_size) - 1
             ):
                 blocks = self.req_to_blocks[request_id]
-                if blocks[last_state_block_idx] != self._null_block:
-                    freed_block = blocks[last_state_block_idx]
+                block = blocks[last_state_block_idx]
+                if block != self._null_block and block.block_hash is None:
+                    freed_block = block
                     self.block_pool.free_blocks([freed_block])
                     blocks[last_state_block_idx] = self._null_block
                     self._on_blocks_freed_early(request_id, [freed_block])
+
+    def _remove_blocks_in_range(
+        self, request_id: str, first_block: int, last_block: int
+    ) -> None:
+        if self.mamba_cache_mode != "align":
+            return super()._remove_blocks_in_range(
+                request_id, first_block, last_block
+            )
+        blocks = self.req_to_blocks.get(request_id, [])
+        first_block = max(first_block, self._num_retired_blocks.get(request_id, 0))
+        last_block = min(last_block, len(blocks))
+        if first_block >= last_block:
+            return
+        freed: list[KVCacheBlock] = []
+        for i in range(last_block - 1, first_block - 1, -1):
+            block = blocks[i]
+            if block.is_null:
+                continue
+            if block.block_hash is not None:
+                # A published Mamba replay boundary may be skipped by this
+                # request but is still needed by later prefix-cache consumers.
+                continue
+            freed.append(block)
+            blocks[i] = self._null_block
+        if freed:
+            self.block_pool.free_blocks(freed)
+            self._on_blocks_freed_early(request_id, freed)
+        self._num_retired_blocks[request_id] = last_block
 
     def _on_blocks_freed_early(
         self, request_id: str, blocks: list[KVCacheBlock]
@@ -1781,6 +1829,43 @@ class MambaManager(SingleTypeKVCacheManager):
         )
         return effective_tokens, materialize_next_page
 
+    def add_local_computed_blocks(
+        self,
+        request_id: str,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        num_local_computed_tokens: int,
+        num_external_computed_tokens: int,
+    ) -> None:
+        """Attach a cache hit and privatize its mutable aligned state.
+
+        Align-mode kernels use the terminal hit block as both the initial state
+        and the in-place output state of the resumed request. A full-block hit
+        therefore needs CoW just like a fine-grained partial hit; otherwise the
+        new request overwrites the shared prefix snapshot under its old hash.
+        """
+        super().add_local_computed_blocks(
+            request_id,
+            new_computed_blocks,
+            num_local_computed_tokens,
+            num_external_computed_tokens,
+        )
+        if (
+            self.mamba_cache_mode != "align"
+            or num_external_computed_tokens > 0
+            or num_local_computed_tokens <= 0
+            or num_local_computed_tokens % self.block_size != 0
+        ):
+            return
+
+        block_idx = num_local_computed_tokens // self.block_size - 1
+        blocks = self.req_to_blocks[request_id]
+        if block_idx >= len(blocks):
+            return
+        source_block = blocks[block_idx]
+        if source_block.is_null or source_block.block_hash is None:
+            return
+        self._aligned_state_cow_reqs[request_id] = (block_idx, source_block)
+
     def get_num_blocks_to_allocate(
         self,
         request_id: str,
@@ -1838,8 +1923,20 @@ class MambaManager(SingleTypeKVCacheManager):
                 )
                 or request_id in self._partial_hit_reqs
             )
-            if has_partial_hit:
-                num_new_blocks = max(num_new_blocks, 0) + 1
+            # A first-time aligned cache hit is attached only after this
+            # admission check, so infer its CoW reservation from the incoming
+            # hit geometry as well as from already-registered continuations.
+            has_aligned_state_cow = request_id in self._aligned_state_cow_reqs or (
+                total_computed_tokens == num_local_computed_tokens
+                and num_local_computed_tokens > 0
+                and num_local_computed_tokens % self.block_size == 0
+                and len(new_computed_blocks) > 0
+                and not new_computed_blocks[-1].is_null
+                and new_computed_blocks[-1].block_hash is not None
+            )
+            num_cow_blocks = int(has_partial_hit) + int(has_aligned_state_cow)
+            if num_cow_blocks:
+                num_new_blocks = max(num_new_blocks, 0) + num_cow_blocks
             checkpoint_position = get_mamba_prefill_checkpoint_position(
                 num_tokens_main_model,
                 self.block_pool.hash_block_size,
@@ -1864,7 +1961,7 @@ class MambaManager(SingleTypeKVCacheManager):
                     self._checkpoints.pop(request_id, None)
             if num_new_blocks > 0:
                 blocks_allocated = request_id in self._allocated_block_reqs
-                physical_block_cap = 1 + int(has_partial_hit) + checkpoint_block
+                physical_block_cap = 1 + num_cow_blocks + checkpoint_block
                 if not blocks_allocated or checkpoint_block:
                     physical_block_cap += self.num_speculative_blocks
                 if materialize_next_page:
@@ -1900,12 +1997,15 @@ class MambaManager(SingleTypeKVCacheManager):
             )
             checkpoint_block = int(request_id in self._checkpoints)
             partial_hit = self._partial_hit_reqs.get(request_id)
+            aligned_state_cow = self._aligned_state_cow_reqs.get(request_id)
             has_partial_hit = partial_hit is not None
+            has_aligned_state_cow = aligned_state_cow is not None
+            num_cow_blocks = int(has_partial_hit) + int(has_aligned_state_cow)
             # `num_required_blocks` might be less than `len(req_blocks)` if blocks are
             # over-allocated at last round.
             if (
                 num_required_blocks <= len(req_blocks)
-                and not has_partial_hit
+                and not num_cow_blocks
                 and not checkpoint_block
             ):
                 self._allocated_block_reqs.add(request_id)
@@ -1952,18 +2052,24 @@ class MambaManager(SingleTypeKVCacheManager):
                         else:
                             break
                 num_new_blocks = max(num_required_blocks - len(req_blocks), 0)
-                if has_partial_hit:
-                    num_new_blocks = max(num_new_blocks, 0) + 1
-                max_new_blocks = 1 + int(has_partial_hit) + checkpoint_block
+                if num_cow_blocks:
+                    num_new_blocks = max(num_new_blocks, 0) + num_cow_blocks
+                max_new_blocks = 1 + num_cow_blocks + checkpoint_block
                 if not blocks_allocated or checkpoint_block:
                     max_new_blocks += self.num_speculative_blocks
                 if materialize_next_page:
                     max_new_blocks += 1
                 assert num_new_blocks <= max_new_blocks
                 new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+                if self._record_new_block_ids:
+                    self.new_block_ids.extend(block.block_id for block in new_blocks)
                 returned_blocks = req_blocks[prev_block_len:]
-                if partial_hit is not None:
-                    block_idx, source_block = partial_hit
+                pending_cows = [
+                    entry
+                    for entry in (partial_hit, aligned_state_cow)
+                    if entry is not None
+                ]
+                for block_idx, source_block in pending_cows:
                     cow_block = new_blocks[0]
                     new_blocks = new_blocks[1:]
                     if blocks_allocated:
@@ -1976,13 +2082,13 @@ class MambaManager(SingleTypeKVCacheManager):
                         self.block_pool.move_block_hashes(source_block, cow_block)
                         self._pending_cow_copies.append((source_block, cow_block))
                         source_block.ref_cnt += 1
-                        boundary_tokens = self._producer_partial_tail_reqs.pop(
+                        boundary_tokens = self._producer_boundary_state_reqs.pop(
                             request_id, None
                         )
                         if boundary_tokens is not None:
                             # This CoW preserved a producer's own boundary
-                            # state in cow_block; hand it to the connector for
-                            # partial-tail offload once the copy has run.
+                            # state in cow_block; hand it to the connector once
+                            # the copy has run.
                             self._pending_boundary_state_offloads.append(
                                 (
                                     request_id,
@@ -2001,6 +2107,7 @@ class MambaManager(SingleTypeKVCacheManager):
                 req_blocks.extend(new_blocks)
                 self._allocated_block_reqs.add(request_id)
                 self._partial_hit_reqs.pop(request_id, None)
+                self._aligned_state_cow_reqs.pop(request_id, None)
                 returned_blocks.extend(new_blocks)
                 return returned_blocks
 
@@ -2019,8 +2126,10 @@ class MambaManager(SingleTypeKVCacheManager):
         if self.mamba_cache_mode == "align":
             self._allocated_block_reqs.discard(request_id)
             self.last_state_block_idx.pop(request_id, None)
+            self._num_retired_blocks.pop(request_id, None)
             self._checkpoints.pop(request_id, None)
-            self._producer_partial_tail_reqs.pop(request_id, None)
+            self._producer_boundary_state_reqs.pop(request_id, None)
+            self._aligned_state_cow_reqs.pop(request_id, None)
             # An offer is only guaranteed to hold committed bytes until the end
             # of the pass that made it. This request's blocks are going back to
             # the pool now, so drop its not-yet-offered hand-offs rather than
@@ -2097,6 +2206,33 @@ class MambaManager(SingleTypeKVCacheManager):
                             (idx + 1) * self.block_size,
                         )
                     )
+            if (
+                self.mamba_cache_mode == "align"
+                and num_tokens > 0
+                and num_tokens % self.block_size == 0
+            ):
+                # The terminal aligned state is now a published prefix-cache
+                # snapshot, but the running request will use and overwrite the
+                # same physical row on its next continuation. Preserve the
+                # advertised bytes with CoW before that forward runs.
+                boundary_idx = num_tokens // self.block_size - 1
+                if (
+                    num_cached_blocks_before
+                    <= boundary_idx
+                    < num_cached_blocks_after
+                ):
+                    boundary_block = blocks[boundary_idx]
+                    if (
+                        not boundary_block.is_null
+                        and boundary_block.block_hash is not None
+                    ):
+                        self._aligned_state_cow_reqs[request.request_id] = (
+                            boundary_idx,
+                            boundary_block,
+                        )
+                        self._producer_boundary_state_reqs[request.request_id] = (
+                            num_tokens
+                        )
 
     def new_step_starts(self) -> None:
         self.cached_blocks_this_step.clear()
@@ -2180,7 +2316,7 @@ class MambaManager(SingleTypeKVCacheManager):
             # in ``source_block`` but the next step's forward overwrites it. The
             # upcoming CoW copies it into a durable cow_block; record the req so
             # allocate_new_blocks hands that block to the connector for offload.
-            self._producer_partial_tail_reqs[request.request_id] = num_tokens
+            self._producer_boundary_state_reqs[request.request_id] = num_tokens
         return partial_hash
 
 

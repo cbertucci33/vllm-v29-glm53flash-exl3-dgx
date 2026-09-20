@@ -20,6 +20,10 @@ from vllm.forward_context import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
+from vllm.model_executor.layers.indexer_topk import (
+    RADIX_TOPK_WORKSPACE_SIZE,
+    run_indexer_topk,
+)
 from vllm.platforms import current_platform
 
 if TYPE_CHECKING:
@@ -49,8 +53,6 @@ elif current_platform.is_xpu():
     from vllm._xpu_ops import xpu_ops
 
 logger = init_logger(__name__)
-
-RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
@@ -252,6 +254,7 @@ def sparse_attn_indexer_kpool(
     # path and when the tail cache is disabled.
     tail_kv_cache: torch.Tensor | None = None,
     tail_prefix: str | None = None,
+    topk_backend: str = "auto",
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
     attn_metadata = get_forward_context().attn_metadata
@@ -791,18 +794,15 @@ def sparse_attn_indexer_kpool(
         else:
             topk_dst = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
 
-        if current_platform.is_cuda() and select_k in (512, 1024, 2048):
-            workspace_manager = current_workspace_manager()
-            (topk_workspace,) = workspace_manager.get_simultaneous(
-                ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
-            )
-            torch.ops._C.persistent_topk(
+        if current_platform.is_cuda():
+            run_indexer_topk(
                 logits,
                 seq_lens,
+                next_n,
                 topk_dst,
-                topk_workspace,
                 select_k,
                 attn_metadata_narrowed.max_seq_len,
+                topk_backend,
             )
         else:
             if current_platform.is_xpu():
@@ -901,6 +901,11 @@ class SparseAttnIndexerKpool(CustomOp):
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
+        self.topk_backend = (
+            _cfg.kernel_config.sparse_indexer_topk_backend
+            if (_cfg := get_current_vllm_config_or_none()) is not None
+            else "auto"
+        )
         if current_platform.is_cuda() and not has_deep_gemm():
             raise RuntimeError(
                 "Sparse Attention Indexer CUDA op requires DeepGEMM to be installed."
@@ -987,6 +992,7 @@ class SparseAttnIndexerKpool(CustomOp):
             positions,
             self.tail_cache.kv_cache if self.tail_cache is not None else None,
             self.tail_cache.prefix if self.tail_cache is not None else None,
+            self.topk_backend,
         )
 
     def forward_hip(

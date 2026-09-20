@@ -17,6 +17,7 @@ from vllm.v1.core.kv_cache_coordinator import (
     KVCacheCoordinator,
     get_kv_cache_coordinator,
 )
+from vllm.v1.core.kv_cache_utils import get_draft_replay_reserve
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -139,6 +140,9 @@ class SimpleCPUOffloadScheduler:
             pcp_world_size=1,
             scheduler_block_size=self.block_size,
             hash_block_size=self.hash_block_size,
+        )
+        self.cpu_coordinator.draft_replay_reserve = get_draft_replay_reserve(
+            self.cpu_kv_cache_config.kv_cache_groups
         )
         self.cpu_block_pool: BlockPool = self.cpu_coordinator.block_pool
         # GPU block pool reference - bound after scheduler builds kv_cache_manager
@@ -264,7 +268,12 @@ class SimpleCPUOffloadScheduler:
             return 0, False
         # Must recompute at least the last token, matching the logic in
         # kv_cache_manager.get_computed_blocks().
-        max_hit_len = request.num_tokens - 1 - num_computed_tokens
+        max_hit_len = (
+            request.num_tokens
+            - 1
+            - self.cpu_coordinator.draft_replay_reserve
+            - num_computed_tokens
+        )
         if max_hit_len <= 0:
             return 0, False
         cpu_hit_blocks, hit_length, _ = self.cpu_coordinator.find_longest_cache_hit(

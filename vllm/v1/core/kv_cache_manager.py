@@ -14,12 +14,15 @@ from vllm.v1.core.kv_cache_coordinator import (
     get_kv_cache_coordinator,
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
+from vllm.v1.core.kv_cache_utils import (
+    KVCacheBlock,
+    KVCacheBlockCopy,
+    get_draft_replay_reserve,
+)
 from vllm.v1.core.single_type_kv_cache_manager import MambaManager
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CrossAttentionSpec,
-    DFlashSWASpec,
     EncoderOnlyAttentionSpec,
     KVCacheConfig,
     MambaSpec,
@@ -145,7 +148,9 @@ class KVCacheManager:
 
         self.enable_caching = enable_caching
         self.enable_kv_cache_events = enable_kv_cache_events
-        self.use_eagle = use_eagle
+        # This constructor argument is the precise target-cache tail-drop
+        # capability, not the broader hidden-state/draft-group predicate.
+        self.use_eagle_block_drop = use_eagle
         self.log_stats = log_stats
         self.metrics_collector = metrics_collector
         # FIXME: make prefix cache stats conditional on log_stats. We still need
@@ -157,7 +162,7 @@ class KVCacheManager:
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
             max_in_flight_tokens=max_in_flight_tokens,
-            use_eagle=self.use_eagle,
+            use_eagle=self.use_eagle_block_drop,
             enable_caching=self.enable_caching,
             enable_kv_cache_events=enable_kv_cache_events,
             dcp_world_size=dcp_world_size,
@@ -184,21 +189,20 @@ class KVCacheManager:
                     manager.fine_grained_prefix_cache = True
         for manager in self.coordinator.single_type_managers:
             if isinstance(manager, MambaManager):
-                manager.drop_eagle_checkpoint_block = self.use_eagle
+                manager.drop_eagle_checkpoint_block = self.use_eagle_block_drop
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
         self.kv_cache_config = kv_cache_config
 
-        self.draft_replay_reserve = 0
-        if self.coordinator.enable_partial_hash_hits:
-            self.draft_replay_reserve = max(
-                (
-                    group.kv_cache_spec.sliding_window
-                    for group in kv_cache_config.kv_cache_groups
-                    if type(group.kv_cache_spec) is DFlashSWASpec
-                ),
-                default=0,
-            )
+        # Private DFlash draft KV must be rebuilt on every cached
+        # resume. Fine-grained hashing controls only the granularity of the
+        # restorable target-state boundary; it does not remove that replay
+        # requirement. When partial hits are unavailable, the coordinator
+        # rounds the capped hit to the scheduler alignment.
+        self.draft_replay_reserve = get_draft_replay_reserve(
+            kv_cache_config.kv_cache_groups
+        )
+        self.coordinator.draft_replay_reserve = self.draft_replay_reserve
 
         # Watermark: minimum number of KV cache blocks to keep free when
         # admitting waiting/preempted requests, to avoid frequent preemptions.
@@ -220,6 +224,10 @@ class KVCacheManager:
         self.empty_kv_cache_blocks = KVCacheBlocks(
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
+
+    def get_replay_boundary(self, request: Request) -> int:
+        """Return the exact target-state boundary a later request can restore."""
+        return self.coordinator.get_replay_boundary(request)
 
     @property
     def usage(self) -> float:
@@ -360,10 +368,21 @@ class KVCacheManager:
             return self.empty_kv_cache_blocks, 0, 0, False
 
         fa_group_id = coordinator.full_attention_group_id
-        computed, per_group_hits = coordinator.find_longest_cache_hit_per_group(
-            request.block_hashes, request.num_tokens - 1
+        max_cache_hit_length = max(
+            request.num_tokens - 1 - self.draft_replay_reserve, 0
         )
-        if any(hit > per_group_hits[fa_group_id] for hit in per_group_hits):
+        computed, per_group_hits = coordinator.find_longest_cache_hit_per_group(
+            request.block_hashes, max_cache_hit_length
+        )
+        cacheable_group_hits = tuple(
+            hit
+            for hit, group in zip(
+                per_group_hits, self.kv_cache_config.kv_cache_groups
+            )
+            if group.kv_cache_spec.prefix_cacheable
+        )
+        assert cacheable_group_hits
+        if any(hit > per_group_hits[fa_group_id] for hit in cacheable_group_hits):
             # A lagging group hit deeper than full attention means its
             # full-attention blocks were evicted; use the reconciled boundary
             # that every group agrees on.
@@ -372,7 +391,7 @@ class KVCacheManager:
         num_local = per_group_hits[fa_group_id]
         blocks = self.create_kv_cache_blocks(computed)
         # Per-group lookups do not detect an uncached shared prefix (boundary 0).
-        return blocks, num_local, 0, min(per_group_hits) < num_local
+        return blocks, num_local, 0, min(cacheable_group_hits) < num_local
 
     def allocate_slots(
         self,

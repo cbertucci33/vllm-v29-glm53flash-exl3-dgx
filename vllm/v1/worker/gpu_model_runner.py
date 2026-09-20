@@ -236,6 +236,7 @@ from vllm.v1.worker.utils import (
     EncoderTimingStats,
     is_residual_scattered_for_sp,
     raise_if_nan_logits,
+    zero_null_kv_block,
 )
 from vllm.v1.worker.workspace import lock_workspace
 
@@ -6995,6 +6996,8 @@ class GPUModelRunner(
 
         torch.accelerator.synchronize()
         torch.accelerator.empty_cache()
+
+        zero_null_kv_block(self.kv_caches)
 
         # Lock workspace to prevent resizing during execution.
         # Max workspace sizes should have been captured during warmup/profiling.

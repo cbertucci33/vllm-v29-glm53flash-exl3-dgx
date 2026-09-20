@@ -319,6 +319,7 @@ class Scheduler(SchedulerInterface):
                 self.cache_config.enable_mamba_fine_grained_prefix_cache
             ),
         )
+        self.draft_replay_reserve = self.kv_cache_manager.draft_replay_reserve
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
         if self.connector is not None:
@@ -363,12 +364,6 @@ class Scheduler(SchedulerInterface):
                 if isinstance(group.kv_cache_spec, MambaSpec)
             ),
             None,
-        )
-        eagle_groups = [
-            group for group in kv_cache_config.kv_cache_groups if group.is_eagle_group
-        ]
-        self.mamba_eagle_skip_backoff = bool(eagle_groups) and all(
-            not group.kv_cache_spec.prefix_cacheable for group in eagle_groups
         )
         # A finer prefix_match_unit is configured: a mamba partial tail entry
         # can only be registered by a step ending exactly at the prompt's last
@@ -456,9 +451,7 @@ class Scheduler(SchedulerInterface):
         # Eagle, FullAttn prunes the last matching block, so back off one
         # block to avoid a Mamba cache miss.
         last_cache_position = request.num_tokens - request.num_tokens % block_size
-        if self.use_eagle_block_drop and not getattr(
-            self, "mamba_eagle_skip_backoff", False
-        ):
+        if self.use_eagle_block_drop:
             last_cache_position = max(last_cache_position - block_size, 0)
 
         end = start + num_new_tokens
@@ -519,6 +512,11 @@ class Scheduler(SchedulerInterface):
             and junction <= request.num_prompt_tokens
             else block_floored
         )
+        replay_boundary = (
+            self.kv_cache_manager.get_replay_boundary(request)
+            if self.draft_replay_reserve
+            else 0
+        )
         stops = (
             # Same invariant: a chunk starting mid-block stops at the boundary
             # rather than running past it.
@@ -533,6 +531,10 @@ class Scheduler(SchedulerInterface):
             # Marconi shared-prefix junction: cache its state so sibling
             # requests sharing the prefix can reuse it.
             junction_stop if start < junction < end else 0,
+            # Sparse retention publishes this exact state for the next request.
+            # It must be a real forward-pass boundary; otherwise the hash can
+            # name an unwritten or subsequently advanced recurrent-state page.
+            replay_boundary if start < replay_boundary < end else 0,
         )
         # Stop at the earliest mandatory position strictly inside the chunk.
         end = min((s for s in stops if start < s < end), default=end)

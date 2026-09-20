@@ -156,6 +156,11 @@ class KVCacheSpec:
         return True
 
     @property
+    def uses_slot_mapping(self) -> bool:
+        """Whether the generic position-based slot mapper owns this cache."""
+        return True
+
+    @property
     def num_heads(self) -> int:
         raise NotImplementedError
 
@@ -194,6 +199,10 @@ class KVCacheSpec:
             The KV cache size in bytes
         """
         raise NotImplementedError
+
+    def speculative_scratch_bytes(self, vllm_config: VllmConfig) -> int:
+        """Subset of the per-request footprint held only while running."""
+        return 0
 
     def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
         """
@@ -801,6 +810,10 @@ class CircularBufferSpec(AttentionSpec):
     def prefix_cacheable(self) -> bool:
         return False
 
+    @property
+    def uses_slot_mapping(self) -> bool:
+        return False
+
 
 @dataclass(frozen=True, kw_only=True)
 class SlidingWindowMLASpec(SlidingWindowSpec):
@@ -889,6 +902,10 @@ class KpoolTailSpec(SlidingWindowSpec):
     def prefix_cacheable(self) -> bool:
         return False
 
+    @property
+    def uses_slot_mapping(self) -> bool:
+        return False
+
 
 @dataclass(frozen=True)
 class MambaSpec(KVCacheSpec):
@@ -940,6 +957,9 @@ class MambaSpec(KVCacheSpec):
             )
         else:
             return self.page_size_bytes * (1 + self.num_speculative_blocks)
+
+    def speculative_scratch_bytes(self, vllm_config: VllmConfig) -> int:
+        return self.page_size_bytes * self.num_speculative_blocks
 
     def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
         # Mamba state is replicated across DCP/PCP ranks, never sharded, so
@@ -1092,6 +1112,10 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
         return all(spec.prefix_cacheable for spec in self.kv_cache_specs.values())
 
     @property
+    def uses_slot_mapping(self) -> bool:
+        return self.first_spec.uses_slot_mapping
+
+    @property
     def first_spec(self) -> KVCacheSpec:
         """Return the first spec in the group."""
         return next(iter(self.kv_cache_specs.values()))
@@ -1106,6 +1130,13 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
             for spec in self.kv_cache_specs.values()
         )
         return max_num_pages * self.page_size_bytes
+
+    def speculative_scratch_bytes(self, vllm_config: VllmConfig) -> int:
+        max_scratch_pages = max(
+            cdiv(spec.speculative_scratch_bytes(vllm_config), spec.page_size_bytes)
+            for spec in self.kv_cache_specs.values()
+        )
+        return max_scratch_pages * self.page_size_bytes
 
     def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
         # Metadata builders are constructed from the per-layer spec, so the base

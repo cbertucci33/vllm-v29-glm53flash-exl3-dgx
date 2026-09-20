@@ -530,6 +530,8 @@ def make_nixl_scheduler(
         block_size=16,
         mamba_enabled=has_mamba,
     )
+    sched.scheduler_block_size = 16
+    sched.draft_replay_reserve = 0
 
     if heartbeat:
         sched._heartbeat_by_engine = {}
@@ -592,6 +594,8 @@ def make_nixl_push_scheduler(
         block_size=16,
         mamba_enabled=has_mamba,
     )
+    sched.scheduler_block_size = 16
+    sched.draft_replay_reserve = 0
 
     # vllm_config is consulted for parallel_config.tensor_parallel_size.
     vllm_config = MagicMock()
